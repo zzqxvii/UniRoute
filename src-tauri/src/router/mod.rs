@@ -1322,9 +1322,88 @@ mod tests {
 }
 
 /// 将 Responses API 请求转换为 Chat API 请求
+/// 支持：
+/// 1. 标准 Responses API 格式：{"input": ...}
+/// 2. Codex 格式（Chat API 风格）：{"messages": [...]}
 pub fn responses_to_chat_request(responses_req: &ResponsesRequest) -> ChatRequest {
+    // 首先检查是否是 Codex 格式（extra 中有 messages 字段）
+    if let Some(messages_value) = responses_req.extra.get("messages") {
+        if let Some(messages_array) = messages_value.as_array() {
+            tracing::info!("检测到 Codex 格式的 Responses 请求（使用 messages 字段）");
+            let messages: Vec<crate::models::Message> = messages_array
+                .iter()
+                .filter_map(|msg| {
+                    let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
+                    let content = msg.get("content");
+                    
+                    let msg_content = match content {
+                        Some(c) if c.is_string() => {
+                            crate::models::MessageContent::Text(c.as_str().unwrap_or("").to_string())
+                        }
+                        Some(c) if c.is_array() => {
+                            // 处理 Codex 格式的 content 数组: [{"text": "...", "type": "text"}]
+                            let parts: Vec<crate::models::ContentPart> = c
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .filter_map(|part| {
+                                    let part_type = part.get("type").and_then(|t| t.as_str()).unwrap_or("text");
+                                    let text = part.get("text").and_then(|t| t.as_str());
+                                    
+                                    if part_type == "text" {
+                                        text.map(|t| crate::models::ContentPart {
+                                            content_type: "text".to_string(),
+                                            text: Some(t.to_string()),
+                                            image_url: None,
+                                            extra: serde_json::Map::new(),
+                                        })
+                                    } else if part_type == "image_url" {
+                                        part.get("image_url").map(|img_url| crate::models::ContentPart {
+                                            content_type: "image_url".to_string(),
+                                            text: None,
+                                            image_url: Some(crate::models::ImageUrl {
+                                                url: img_url.get("url").and_then(|u| u.as_str()).unwrap_or("").to_string(),
+                                                detail: None,
+                                            }),
+                                            extra: serde_json::Map::new(),
+                                        })
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect();
+                            crate::models::MessageContent::Parts(parts)
+                        }
+                        _ => crate::models::MessageContent::Text(String::new()),
+                    };
+                    
+                    Some(crate::models::Message {
+                        role: role.to_string(),
+                        content: msg_content,
+                        name: None,
+                        tool_calls: Vec::new(),
+                        tool_call_id: None,
+                    })
+                })
+                .collect();
+            
+            let tools = responses_req.tools.clone();
+            
+            return ChatRequest {
+                model: responses_req.model.clone(),
+                messages,
+                stream: responses_req.stream,
+                temperature: responses_req.temperature.map(|t| t as f32),
+                max_tokens: responses_req.max_output_tokens.map(|t| t as u32),
+                tools,
+                extra: serde_json::Map::new(),
+            };
+        }
+    }
+    
+    // 标准 Responses API 格式
     let messages = match &responses_req.input {
-        crate::models::ResponsesInput::Text(text) => {
+        Some(crate::models::ResponsesInput::Text(text)) => {
             vec![crate::models::Message {
                 role: "user".to_string(),
                 content: crate::models::MessageContent::Text(text.clone()),
@@ -1333,7 +1412,7 @@ pub fn responses_to_chat_request(responses_req: &ResponsesRequest) -> ChatReques
                 tool_call_id: None,
             }]
         }
-        crate::models::ResponsesInput::Items(items) => {
+        Some(crate::models::ResponsesInput::Items(items)) => {
             items
                 .iter()
                 .filter_map(|item| {
@@ -1416,7 +1495,7 @@ pub fn responses_to_chat_request(responses_req: &ResponsesRequest) -> ChatReques
                 })
                 .collect()
         }
-        crate::models::ResponsesInput::Raw(value) => {
+        Some(crate::models::ResponsesInput::Raw(value)) => {
             // 尝试从原始值中提取信息
             tracing::warn!("Responses API 收到未知的 input 格式，尝试转换: {:?}", value);
             // 如果是对象，尝试提取内容作为文本
@@ -1438,6 +1517,17 @@ pub fn responses_to_chat_request(responses_req: &ResponsesRequest) -> ChatReques
                     tool_call_id: None,
                 }]
             }
+        }
+        None => {
+            // 没有 input 字段，也没有 messages 字段，使用空消息
+            tracing::warn!("Responses API 请求没有 input 或 messages 字段");
+            vec![crate::models::Message {
+                role: "user".to_string(),
+                content: crate::models::MessageContent::Text(String::new()),
+                name: None,
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+            }]
         }
     };
 

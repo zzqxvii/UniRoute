@@ -547,13 +547,17 @@ pub struct ImageUrl {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResponsesRequest {
     pub model: String,
-    pub input: ResponsesInput,
+    /// Responses API 的 input 字段（可选，某些客户端如 Codex 可能发送 messages 字段）
+    #[serde(default)]
+    pub input: Option<ResponsesInput>,
     #[serde(default)] pub stream: bool,
     #[serde(default)] pub instructions: Option<String>,
     #[serde(default)] pub tools: Vec<Tool>,
     #[serde(default)] pub temperature: Option<f64>,
     #[serde(default)] pub max_output_tokens: Option<i32>,
-    #[serde(flatten)] pub extra: serde_json::Map<String, serde_json::Value>,
+    /// 捕获额外字段（如 messages，用于兼容 Chat API 格式的请求）
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
