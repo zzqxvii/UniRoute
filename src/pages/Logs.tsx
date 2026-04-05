@@ -19,9 +19,10 @@ interface RequestLog {
   completion_tokens: number | null;
   cost: number | null;
   error: string | null;
+  original_request_body: string | null;
   request_body: string | null;
-  response_body: string | null;
   original_response_body: string | null;
+  response_body: string | null;
 }
 
 interface RequestStats {
@@ -125,9 +126,10 @@ function exportLogsAsJson(logs: RequestLog[], stats: RequestStats | null) {
     stats,
     logs: logs.map((log) => ({
       ...log,
+      original_request_body: log.original_request_body ? JSON.parse(log.original_request_body) : null,
       request_body: log.request_body ? JSON.parse(log.request_body) : null,
-      response_body: log.response_body ? JSON.parse(log.response_body) : null,
       original_response_body: log.original_response_body ? JSON.parse(log.original_response_body) : null,
+      response_body: log.response_body ? JSON.parse(log.response_body) : null,
     })),
   };
   const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
@@ -816,11 +818,49 @@ function Logs() {
                 </div>
               )}
 
+              {/* 原始请求内容（仅在协议转换时显示） */}
+              {selectedLog.protocol_transform && selectedLog.protocol_transform !== 'direct' && selectedLog.original_request_body && (
+                <div>
+                  <div className="flex items-center justify-between mb-2">
+                    <h3 className="text-[11px] text-blue-600 dark:text-blue-400 uppercase tracking-wider font-bold">
+                      原始请求（转换前）
+                    </h3>
+                    <button
+                      onClick={() => {
+                        const json = formatJson(selectedLog.original_request_body);
+                        if (json) navigator.clipboard.writeText(json);
+                      }}
+                      className="flex items-center gap-1 px-2 py-1 text-xs text-gray-400 hover:text-gray-600 dark:hover:text-gray-200 transition-colors"
+                    >
+                      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          strokeWidth={2}
+                          d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"
+                        />
+                      </svg>
+                      复制
+                    </button>
+                  </div>
+                  <pre className="bg-blue-950 text-blue-100 p-4 rounded-lg text-xs overflow-x-auto max-h-60 overflow-y-auto leading-relaxed border border-blue-800">
+                    {formatJson(selectedLog.original_request_body) || '-'}
+                  </pre>
+                </div>
+              )}
+
               {/* 请求内容 */}
               <div>
                 <div className="flex items-center justify-between mb-2">
                   <h3 className="text-[11px] text-gray-500 dark:text-gray-400 uppercase tracking-wider font-bold">
-                    请求内容
+                    {selectedLog.protocol_transform && selectedLog.protocol_transform !== 'direct' && selectedLog.original_request_body
+                      ? '转换后请求'
+                      : '请求内容'}
+                    {selectedLog.protocol_transform && selectedLog.protocol_transform !== 'direct' && selectedLog.original_request_body && (
+                      <span className="ml-2 px-1.5 py-0.5 rounded text-[9px] bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-400">
+                        已转换
+                      </span>
+                    )}
                   </h3>
                   <button
                     onClick={() => {
@@ -849,7 +889,9 @@ function Logs() {
               <div>
                 <div className="flex items-center justify-between mb-2">
                   <h3 className="text-[11px] text-gray-500 dark:text-gray-400 uppercase tracking-wider font-bold">
-                    响应内容
+                    {selectedLog.protocol_transform && selectedLog.protocol_transform !== 'direct' && selectedLog.original_response_body
+                      ? '转换后响应'
+                      : '响应内容'}
                     {selectedLog.protocol_transform && selectedLog.protocol_transform !== 'direct' && selectedLog.original_response_body && (
                       <span className="ml-2 px-1.5 py-0.5 rounded text-[9px] bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-400">
                         已转换

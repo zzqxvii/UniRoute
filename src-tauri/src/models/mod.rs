@@ -372,10 +372,14 @@ pub struct RequestLog {
     pub completion_tokens: Option<i32>,
     pub cost: Option<f64>,
     pub error: Option<String>,
+    /// 原始请求（客户端发送的请求）
+    pub original_request_body: Option<String>,
+    /// 转换后的请求（发送给上游的请求）
     pub request_body: Option<String>,
-    pub response_body: Option<String>,
-    /// 原始响应（协议转换前的上游响应）
+    /// 原始响应（上游返回的响应）
     pub original_response_body: Option<String>,
+    /// 转换后的响应（返回给客户端的响应）
+    pub response_body: Option<String>,
 }
 
 impl RequestLog {
@@ -397,9 +401,10 @@ impl RequestLog {
             completion_tokens: None,
             cost: None,
             error: None,
+            original_request_body: None,
             request_body: None,
-            response_body: None,
             original_response_body: None,
+            response_body: None,
         }
     }
 
@@ -410,9 +415,14 @@ impl RequestLog {
     pub fn with_model(mut self, model: String) -> Self { self.model = Some(model); self }
     pub fn with_provider(mut self, name: String, prefix: String) -> Self { self.provider = Some(name); self.provider_prefix = Some(prefix); self }
     pub fn with_url(mut self, url: String) -> Self { self.url = Some(url); self }
+    /// 保存原始请求（客户端发送的）
+    pub fn with_original_request(mut self, request: String) -> Self { self.original_request_body = Some(request); self }
+    /// 保存转换后的请求（发送给上游的）
     pub fn with_request(mut self, request: String) -> Self { self.request_body = Some(request); self }
-    pub fn with_response(mut self, response: String) -> Self { self.response_body = Some(response); self }
+    /// 保存原始响应（上游返回的）
     pub fn with_original_response(mut self, response: String) -> Self { self.original_response_body = Some(response); self }
+    /// 保存转换后的响应（返回给客户端的）
+    pub fn with_response(mut self, response: String) -> Self { self.response_body = Some(response); self }
     pub fn with_error(mut self, error: String) -> Self { self.error = Some(error); self }
     pub fn with_tokens(mut self, prompt: i32, completion: i32) -> Self { self.prompt_tokens = Some(prompt); self.completion_tokens = Some(completion); self }
     pub fn with_cost(mut self, cost: f64) -> Self { self.cost = Some(cost); self }

@@ -250,9 +250,9 @@ pub async fn handle_chat_completions(
         }
     };
 
-    // 保存原始请求
+    // 保存原始请求（客户端发送的）
     let request_body_str = String::from_utf8_lossy(&body).to_string();
-    log_entry = log_entry.with_request(request_body_str.clone());
+    log_entry = log_entry.with_original_request(request_body_str.clone());
 
     let chat_request: ChatRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
@@ -287,7 +287,7 @@ pub async fn handle_chat_completions(
         info.provider_name, info.actual_model, route_result.error
     );
 
-    // 使用实际发送的请求体（如果有的话）
+    // 保存转换后的请求（发送给上游的）
     if let Some(ref actual_body) = route_result.actual_request_body {
         if let Ok(body_str) = serde_json::to_string(actual_body) {
             log_entry = log_entry.with_request(body_str);
@@ -656,7 +656,8 @@ pub async fn handle_responses(
     };
 
     let request_body_str = String::from_utf8_lossy(&body).to_string();
-    log_entry = log_entry.with_request(request_body_str.clone());
+    // 保存原始请求（客户端发送的）
+    log_entry = log_entry.with_original_request(request_body_str.clone());
 
     let responses_request: ResponsesRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
@@ -685,7 +686,7 @@ pub async fn handle_responses(
 
     let info = route_result.info.clone();
 
-    // 使用实际发送的请求体更新日志
+    // 保存转换后的请求（发送给上游的）
     if let Some(ref actual_body) = route_result.actual_request_body {
         if let Ok(body_str) = serde_json::to_string(actual_body) {
             log_entry = log_entry.with_request(body_str);

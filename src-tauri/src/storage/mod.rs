@@ -128,9 +128,10 @@ impl Database {
                 completion_tokens INTEGER,
                 cost REAL,
                 error TEXT,
+                original_request_body TEXT,
                 request_body TEXT,
-                response_body TEXT,
-                original_response_body TEXT
+                original_response_body TEXT,
+                response_body TEXT
             );
 
             -- Settings
@@ -198,6 +199,14 @@ impl Database {
             tracing::info!("添加 original_response_body 列到 request_logs 表");
             db.execute(
                 "ALTER TABLE request_logs ADD COLUMN original_response_body TEXT",
+                [],
+            )?;
+        }
+
+        if !columns.contains(&"original_request_body".to_string()) {
+            tracing::info!("添加 original_request_body 列到 request_logs 表");
+            db.execute(
+                "ALTER TABLE request_logs ADD COLUMN original_request_body TEXT",
                 [],
             )?;
         }
@@ -644,8 +653,8 @@ impl Database {
         let db = self.conn.lock().unwrap();
         db.execute(
             r#"INSERT INTO request_logs
-               (timestamp, method, path, requested_model, model, provider, provider_prefix, url, protocol_transform, status_code, latency_ms, first_token_ms, prompt_tokens, completion_tokens, cost, error, request_body, response_body, original_response_body)
-               VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)"#,
+               (timestamp, method, path, requested_model, model, provider, provider_prefix, url, protocol_transform, status_code, latency_ms, first_token_ms, prompt_tokens, completion_tokens, cost, error, original_request_body, request_body, original_response_body, response_body)
+               VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)"#,
             rusqlite::params![
                 log.timestamp.to_rfc3339(),
                 log.method,
@@ -663,9 +672,10 @@ impl Database {
                 log.completion_tokens,
                 log.cost,
                 log.error,
+                log.original_request_body,
                 log.request_body,
-                log.response_body,
                 log.original_response_body,
+                log.response_body,
             ],
         )?;
         Ok(db.last_insert_rowid())
@@ -674,7 +684,7 @@ impl Database {
     pub fn load_request_logs(&self, limit: i64, offset: i64) -> Result<Vec<RequestLog>> {
         let db = self.conn.lock().unwrap();
         let mut stmt = db.prepare(
-            "SELECT id, timestamp, method, path, requested_model, model, provider, provider_prefix, url, protocol_transform, status_code, latency_ms, first_token_ms, prompt_tokens, completion_tokens, cost, error, request_body, response_body, original_response_body
+            "SELECT id, timestamp, method, path, requested_model, model, provider, provider_prefix, url, protocol_transform, status_code, latency_ms, first_token_ms, prompt_tokens, completion_tokens, cost, error, original_request_body, request_body, original_response_body, response_body
              FROM request_logs ORDER BY timestamp DESC LIMIT ?1 OFFSET ?2"
         )?;
         let logs = stmt
@@ -698,9 +708,10 @@ impl Database {
                     completion_tokens: row.get(14)?,
                     cost: row.get(15)?,
                     error: row.get(16)?,
-                    request_body: row.get(17)?,
-                    response_body: row.get(18)?,
+                    original_request_body: row.get(17)?,
+                    request_body: row.get(18)?,
                     original_response_body: row.get(19)?,
+                    response_body: row.get(20)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
