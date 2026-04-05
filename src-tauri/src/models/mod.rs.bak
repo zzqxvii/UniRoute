@@ -1,0 +1,1581 @@
+//! UniRoute 核心数据模型
+//!
+//! 简化架构：Provider（供应商）= baseUrl + API Key + 前缀
+//! 请求模型名 → Group → 模型列表 → 选择模型 → 通过前缀找 Provider → 发送请求
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+
+// ============ 认证类型 ============
+
+/// 认证类型
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthType {
+    ApiKey,
+    OAuth,
+}
+
+impl Default for AuthType {
+    fn default() -> Self {
+        Self::ApiKey
+    }
+}
+
+// ============ OAuth 配置 ============
+
+/// OAuth 配置
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct OAuthConfig {
+    /// 客户端 ID
+    pub client_id: String,
+    /// 客户端密钥（可选）
+    pub client_secret: Option<String>,
+    /// Token URL
+    pub token_url: Option<String>,
+    /// 刷新 Token URL
+    pub refresh_url: Option<String>,
+    /// 授权 URL（设备码流程）
+    pub auth_url: Option<String>,
+    /// 初始化 URL（设备码流程）
+    pub initiate_url: Option<String>,
+    /// 轮询 URL 基础地址
+    pub poll_url_base: Option<String>,
+}
+
+/// OAuth Token 信息
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OAuthTokens {
+    pub access_token: String,
+    pub refresh_token: Option<String>,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub email: Option<String>,
+}
+
+impl OAuthTokens {
+    /// 检查 Token 是否过期
+    pub fn is_expired(&self) -> bool {
+        if let Some(expires_at) = self.expires_at {
+            expires_at < Utc::now()
+        } else {
+            false
+        }
+    }
+
+    /// 检查是否需要刷新（提前5分钟）
+    pub fn needs_refresh(&self) -> bool {
+        if let Some(expires_at) = self.expires_at {
+            expires_at < Utc::now() + chrono::Duration::minutes(5)
+        } else {
+            false
+        }
+    }
+}
+
+// ============ 协议相关 ============
+
+/// API 协议格式
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiFormat {
+    OpenAI,
+    Claude,
+    Gemini,
+}
+
+impl Default for ApiFormat {
+    fn default() -> Self {
+        Self::OpenAI
+    }
+}
+
+impl ApiFormat {
+    pub fn endpoint_path(&self) -> &'static str {
+        match self {
+            ApiFormat::OpenAI => "/v1/chat/completions",
+            ApiFormat::Claude => "/v1/messages",
+            ApiFormat::Gemini => "/v1beta/models",
+        }
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            ApiFormat::OpenAI => "OpenAI",
+            ApiFormat::Claude => "Claude",
+            ApiFormat::Gemini => "Gemini",
+        }
+    }
+}
+
+// ============ Provider（供应商） ============
+
+/// 模型定价配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelPricing {
+    /// 输入价格 ($/1M tokens)
+    pub input: f64,
+    /// 输出价格 ($/1M tokens)
+    pub output: f64,
+}
+
+impl Default for ModelPricing {
+    fn default() -> Self {
+        Self {
+            input: 0.0,
+            output: 0.0,
+        }
+    }
+}
+
+/// 模型配置（包含名称和可选定价）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelConfig {
+    /// 模型名称
+    pub name: String,
+    /// 模型定价（可选）
+    #[serde(default)]
+    pub pricing: Option<ModelPricing>,
+}
+
+impl From<&str> for ModelConfig {
+    fn from(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            pricing: None,
+        }
+    }
+}
+
+impl From<String> for ModelConfig {
+    fn from(name: String) -> Self {
+        Self {
+            name,
+            pricing: None,
+        }
+    }
+}
+
+// ============ 配额管理 ============
+
+/// 配额限制配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuotaLimit {
+    /// 每日限额（美元）
+    #[serde(default)]
+    pub daily_limit: Option<f64>,
+    /// 每月限额（美元）
+    #[serde(default)]
+    pub monthly_limit: Option<f64>,
+    /// 警告阈值（0.0-1.0，默认0.8即80%）
+    #[serde(default = "default_warning_threshold")]
+    pub warning_threshold: f64,
+}
+
+fn default_warning_threshold() -> f64 {
+    0.8
+}
+
+impl Default for QuotaLimit {
+    fn default() -> Self {
+        Self {
+            daily_limit: None,
+            monthly_limit: None,
+            warning_threshold: 0.8,
+        }
+    }
+}
+
+/// 配额使用状态
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct QuotaStatus {
+    /// 今日已使用（美元）
+    pub daily_used: f64,
+    /// 本月已使用（美元）
+    pub monthly_used: f64,
+    /// 今日剩余（美元）
+    pub daily_remaining: Option<f64>,
+    /// 本月剩余（美元）
+    pub monthly_remaining: Option<f64>,
+    /// 今日使用百分比
+    pub daily_percent: Option<f64>,
+    /// 本月使用百分比
+    pub monthly_percent: Option<f64>,
+    /// 是否超出限额
+    pub is_exceeded: bool,
+    /// 是否接近限额（超过警告阈值）
+    pub is_warning: bool,
+}
+
+impl QuotaStatus {
+    /// 计算配额状态
+    pub fn compute(daily_used: f64, monthly_used: f64, limit: &QuotaLimit) -> Self {
+        let daily_remaining = limit.daily_limit.map(|l| (l - daily_used).max(0.0));
+        let monthly_remaining = limit.monthly_limit.map(|l| (l - monthly_used).max(0.0));
+
+        let daily_percent = limit
+            .daily_limit
+            .map(|l| (daily_used / l * 100.0).min(100.0));
+        let monthly_percent = limit
+            .monthly_limit
+            .map(|l| (monthly_used / l * 100.0).min(100.0));
+
+        let daily_exceeded = limit.daily_limit.map(|l| daily_used >= l).unwrap_or(false);
+        let monthly_exceeded = limit
+            .monthly_limit
+            .map(|l| monthly_used >= l)
+            .unwrap_or(false);
+        let is_exceeded = daily_exceeded || monthly_exceeded;
+
+        let daily_warning = limit
+            .daily_limit
+            .map(|l| daily_used / l >= limit.warning_threshold)
+            .unwrap_or(false);
+        let monthly_warning = limit
+            .monthly_limit
+            .map(|l| monthly_used / l >= limit.warning_threshold)
+            .unwrap_or(false);
+        let is_warning = !is_exceeded && (daily_warning || monthly_warning);
+
+        Self {
+            daily_used,
+            monthly_used,
+            daily_remaining,
+            monthly_remaining,
+            daily_percent,
+            monthly_percent,
+            is_exceeded,
+            is_warning,
+        }
+    }
+
+    /// 检查是否允许请求
+    pub fn allow_request(&self) -> Result<(), String> {
+        if self.is_exceeded {
+            let msg = if self.daily_remaining.is_some() {
+                format!("每日配额已用完（已使用 ${:.4}）", self.daily_used)
+            } else {
+                format!("每月配额已用完（已使用 ${:.4}）", self.monthly_used)
+            };
+            Err(msg)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// Provider（供应商）
+///
+/// 一个供应商 = 一个 API 服务
+/// 包含：名称、前缀、baseUrl、API Key
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Provider {
+    pub id: String,               // UUID
+    pub name: String,             // 显示名称，如 "DeepSeek"、"我的 Ollama"
+    pub prefix: String,           // 路由前缀，如 "ds"、"ollama"
+    pub base_url: String,         // API 基础地址
+    pub api_key: Option<String>,  // API 密钥
+    pub api_format: ApiFormat,    // 协议格式
+    pub models: Vec<ModelConfig>, // 支持的模型列表（含定价）
+    /// 是否启用成本统计
+    #[serde(default)]
+    pub enable_cost: bool,
+    /// 认证类型
+    #[serde(default)]
+    pub auth_type: AuthType,
+    /// OAuth 配置
+    #[serde(default)]
+    pub oauth: Option<OAuthConfig>,
+    /// OAuth Token（运行时）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth_tokens: Option<OAuthTokens>,
+    /// 额外请求头
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+    /// 认证头名称
+    #[serde(default = "default_auth_header")]
+    pub auth_header: String,
+    /// 认证前缀
+    #[serde(default)]
+    pub auth_prefix: Option<String>,
+    pub is_active: bool,  // 是否启用
+    pub is_builtin: bool, // 是否内置模板
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+fn default_auth_header() -> String {
+    "Authorization".to_string()
+}
+
+impl Provider {
+    /// 创建新的自定义 Provider
+    pub fn new(name: String, prefix: String, base_url: String) -> Self {
+        let now = Utc::now();
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            name,
+            prefix,
+            base_url,
+            api_key: None,
+            api_format: ApiFormat::OpenAI,
+            models: vec![ModelConfig::from("*")],
+            enable_cost: false, // 默认不计费
+            auth_type: AuthType::ApiKey,
+            oauth: None,
+            oauth_tokens: None,
+            headers: HashMap::new(),
+            auth_header: "Authorization".to_string(),
+            auth_prefix: None,
+            is_active: true,
+            is_builtin: false,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    /// 检查是否需要 OAuth 认证
+    pub fn needs_oauth(&self) -> bool {
+        self.auth_type == AuthType::OAuth && self.oauth_tokens.is_none()
+    }
+
+    /// 检查 OAuth Token 是否需要刷新
+    pub fn needs_token_refresh(&self) -> bool {
+        if self.auth_type != AuthType::OAuth {
+            return false;
+        }
+        if let Some(tokens) = &self.oauth_tokens {
+            tokens.needs_refresh()
+        } else {
+            true
+        }
+    }
+
+    /// 获取认证头值
+    pub fn get_auth_value(&self) -> Option<String> {
+        match self.auth_type {
+            AuthType::ApiKey => {
+                self.api_key.as_ref().map(|key| {
+                    if let Some(prefix) = &self.auth_prefix {
+                        // 如果有明确的前缀配置，使用配置的前缀
+                        if prefix.is_empty() {
+                            key.clone()
+                        } else {
+                            format!("{} {}", prefix, key)
+                        }
+                    } else {
+                        // 根据认证头名称推断默认行为
+                        // Authorization 头通常需要 Bearer 前缀
+                        // x-api-key 等其他头通常不需要前缀
+                        let header_lower = self.auth_header.to_lowercase();
+                        if header_lower == "authorization" {
+                            format!("Bearer {}", key)
+                        } else {
+                            key.clone()
+                        }
+                    }
+                })
+            }
+            AuthType::OAuth => self
+                .oauth_tokens
+                .as_ref()
+                .map(|t| format!("Bearer {}", t.access_token)),
+        }
+    }
+
+    /// 获取模型列表（只返回名称）
+    pub fn model_names(&self) -> Vec<String> {
+        self.models.iter().map(|m| m.name.clone()).collect()
+    }
+
+    /// 获取模型定价
+    pub fn get_model_pricing(&self, model_name: &str) -> Option<&ModelPricing> {
+        self.models
+            .iter()
+            .find(|m| m.name == model_name || m.name == "*")
+            .and_then(|m| m.pricing.as_ref())
+    }
+
+    /// 内置 Provider 模板（用于初始化，实际 Provider 由用户创建）
+    pub fn builtin_templates() -> Vec<ProviderTemplate> {
+        vec![
+            // === OAuth 供应商 ===
+            ProviderTemplate {
+                id: "claude-code".into(),
+                name: "Claude Code (OAuth)".into(),
+                prefix: "cc".into(),
+                default_base_url: "https://api.anthropic.com/v1/messages".into(),
+                api_format: ApiFormat::Claude,
+                auth_type: AuthType::OAuth,
+                oauth: Some(OAuthConfig {
+                    client_id: "9d1c250a-e61b-44d9-88ed-5944d1962f5e".into(),
+                    token_url: Some("https://console.anthropic.com/v1/oauth/token".into()),
+                    ..Default::default()
+                }),
+                headers: vec![
+                    ("Anthropic-Version".into(), "2023-06-01".into()),
+                    (
+                        "Anthropic-Beta".into(),
+                        "claude-code-20250219,oauth-2025-04-20".into(),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+                auth_header: "x-api-key".into(),
+                auth_prefix: None,
+                models: vec![
+                    "claude-opus-4-6",
+                    "claude-sonnet-4-6",
+                    "claude-opus-4-5-20251101",
+                    "claude-sonnet-4-5-20250929",
+                    "claude-haiku-4-5-20251001",
+                ]
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+            },
+            ProviderTemplate {
+                id: "gemini-cli".into(),
+                name: "Gemini CLI (OAuth)".into(),
+                prefix: "gemini-cli".into(),
+                default_base_url: "https://cloudcode-pa.googleapis.com/v1internal".into(),
+                api_format: ApiFormat::Gemini,
+                auth_type: AuthType::OAuth,
+                oauth: Some(OAuthConfig {
+                    client_id:
+                        "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com"
+                            .into(),
+                    ..Default::default()
+                }),
+                headers: HashMap::new(),
+                auth_header: "Authorization".into(),
+                auth_prefix: Some("Bearer".into()),
+                models: vec!["gemini-3-pro-preview", "gemini-2.5-pro", "gemini-2.5-flash"]
+                    .into_iter()
+                    .map(Into::into)
+                    .collect(),
+            },
+            ProviderTemplate {
+                id: "codex".into(),
+                name: "Codex (OAuth)".into(),
+                prefix: "cx".into(),
+                default_base_url: "https://chatgpt.com/backend-api/codex/responses".into(),
+                api_format: ApiFormat::OpenAI,
+                auth_type: AuthType::OAuth,
+                oauth: Some(OAuthConfig {
+                    client_id: "app_EMoamEEZ73f0CkXaXp7hrann".into(),
+                    token_url: Some("https://auth.openai.com/oauth/token".into()),
+                    ..Default::default()
+                }),
+                headers: vec![
+                    ("Version".into(), "0.92.0".into()),
+                    ("Openai-Beta".into(), "responses=experimental".into()),
+                ]
+                .into_iter()
+                .collect(),
+                auth_header: "Authorization".into(),
+                auth_prefix: Some("Bearer".into()),
+                models: vec!["gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex", "gpt-5.2-codex"]
+                    .into_iter()
+                    .map(Into::into)
+                    .collect(),
+            },
+            ProviderTemplate {
+                id: "qwen-oauth".into(),
+                name: "Qwen Code (OAuth)".into(),
+                prefix: "qw".into(),
+                default_base_url:
+                    "https://chat.qwen.ai/api/v1/services/aigc/text-generation/generation".into(),
+                api_format: ApiFormat::OpenAI,
+                auth_type: AuthType::OAuth,
+                oauth: Some(OAuthConfig {
+                    client_id: "f0304373b74a44d2b584a3fb70ca9e56".into(),
+                    token_url: Some("https://chat.qwen.ai/api/v1/oauth2/token".into()),
+                    auth_url: Some("https://chat.qwen.ai/api/v1/oauth2/device/code".into()),
+                    ..Default::default()
+                }),
+                headers: vec![("X-Dashscope-AuthType".into(), "qwen-oauth".into())]
+                    .into_iter()
+                    .collect(),
+                auth_header: "Authorization".into(),
+                auth_prefix: Some("Bearer".into()),
+                models: vec!["qwen3-coder-plus", "qwen3-coder-flash", "vision-model"]
+                    .into_iter()
+                    .map(Into::into)
+                    .collect(),
+            },
+            ProviderTemplate {
+                id: "github-copilot".into(),
+                name: "GitHub Copilot (OAuth)".into(),
+                prefix: "gh".into(),
+                default_base_url: "https://api.githubcopilot.com/chat/completions".into(),
+                api_format: ApiFormat::OpenAI,
+                auth_type: AuthType::OAuth,
+                oauth: Some(OAuthConfig {
+                    client_id: String::new(),
+                    client_secret: None,
+                    token_url: None,
+                    refresh_url: None,
+                    auth_url: None,
+                    initiate_url: None,
+                    poll_url_base: None,
+                }),
+                headers: vec![
+                    ("copilot-integration-id".into(), "vscode-chat".into()),
+                    ("editor-version".into(), "vscode/1.110.0".into()),
+                    ("user-agent".into(), "GitHubCopilotChat/0.38.0".into()),
+                ]
+                .into_iter()
+                .collect(),
+                auth_header: "Authorization".into(),
+                auth_prefix: Some("Bearer".into()),
+                models: vec![
+                    "gpt-4o",
+                    "gpt-4o-mini",
+                    "gpt-4",
+                    "gpt-3.5-turbo",
+                    "claude-sonnet-4",
+                    "claude-opus-4.6",
+                    "gemini-2.5-pro",
+                ]
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+            },
+            ProviderTemplate {
+                id: "cursor".into(),
+                name: "Cursor (OAuth)".into(),
+                prefix: "cu".into(),
+                default_base_url: "https://api2.cursor.sh".into(),
+                api_format: ApiFormat::OpenAI,
+                auth_type: AuthType::OAuth,
+                oauth: Some(OAuthConfig {
+                    client_id: String::new(),
+                    client_secret: None,
+                    token_url: None,
+                    refresh_url: None,
+                    auth_url: None,
+                    initiate_url: None,
+                    poll_url_base: None,
+                }),
+                headers: vec![
+                    ("connect-protocol-version".into(), "1".into()),
+                    ("Content-Type".into(), "application/connect+proto".into()),
+                ]
+                .into_iter()
+                .collect(),
+                auth_header: "Authorization".into(),
+                auth_prefix: Some("Bearer".into()),
+                models: vec![
+                    "claude-4.6-opus",
+                    "claude-4.6-sonnet",
+                    "claude-4.5-sonnet",
+                    "gpt-5.2-codex",
+                ]
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+            },
+            ProviderTemplate {
+                id: "kimi-coding".into(),
+                name: "Kimi Coding (OAuth)".into(),
+                prefix: "kmc".into(),
+                default_base_url: "https://api.kimi.com/coding/v1/messages".into(),
+                api_format: ApiFormat::Claude,
+                auth_type: AuthType::OAuth,
+                oauth: Some(OAuthConfig {
+                    client_id: "17e5f671-d194-4dfb-9706-5516cb48c098".into(),
+                    client_secret: None,
+                    token_url: Some("https://auth.kimi.com/api/oauth/token".into()),
+                    refresh_url: Some("https://auth.kimi.com/api/oauth/token".into()),
+                    auth_url: Some("https://auth.kimi.com/api/oauth/device_authorization".into()),
+                    initiate_url: None,
+                    poll_url_base: None,
+                }),
+                headers: vec![
+                    ("Anthropic-Version".into(), "2023-06-01".into()),
+                    ("Anthropic-Beta".into(), "claude-code-20250219".into()),
+                ]
+                .into_iter()
+                .collect(),
+                auth_header: "x-api-key".into(),
+                auth_prefix: None,
+                models: vec!["kimi-k2.5", "kimi-k2.5-thinking", "kimi-latest"]
+                    .into_iter()
+                    .map(Into::into)
+                    .collect(),
+            },
+            ProviderTemplate {
+                id: "kilocode".into(),
+                name: "Kilocode (OAuth)".into(),
+                prefix: "kc".into(),
+                default_base_url: "https://api.kilo.ai/api/openrouter/chat/completions".into(),
+                api_format: ApiFormat::OpenAI,
+                auth_type: AuthType::OAuth,
+                oauth: Some(OAuthConfig {
+                    client_id: String::new(),
+                    client_secret: None,
+                    token_url: None,
+                    refresh_url: None,
+                    auth_url: None,
+                    initiate_url: Some("https://api.kilo.ai/api/device-auth/codes".into()),
+                    poll_url_base: Some("https://api.kilo.ai/api/device-auth/codes".into()),
+                }),
+                headers: HashMap::new(),
+                auth_header: "Authorization".into(),
+                auth_prefix: Some("Bearer".into()),
+                models: vec![
+                    "openrouter/free",
+                    "qwen/qwen3-coder",
+                    "anthropic/claude-sonnet-4",
+                ]
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+            },
+            ProviderTemplate {
+                id: "cline".into(),
+                name: "Cline (OAuth)".into(),
+                prefix: "cl".into(),
+                default_base_url: "https://api.cline.bot/api/v1/chat/completions".into(),
+                api_format: ApiFormat::OpenAI,
+                auth_type: AuthType::OAuth,
+                oauth: Some(OAuthConfig {
+                    client_id: String::new(),
+                    client_secret: None,
+                    token_url: Some("https://api.cline.bot/api/v1/auth/token".into()),
+                    refresh_url: Some("https://api.cline.bot/api/v1/auth/refresh".into()),
+                    auth_url: Some("https://api.cline.bot/api/v1/auth/authorize".into()),
+                    initiate_url: None,
+                    poll_url_base: None,
+                }),
+                headers: vec![
+                    ("HTTP-Referer".into(), "https://cline.bot".into()),
+                    ("X-Title".into(), "Cline".into()),
+                ]
+                .into_iter()
+                .collect(),
+                auth_header: "Authorization".into(),
+                auth_prefix: Some("Bearer".into()),
+                models: vec![
+                    "anthropic/claude-sonnet-4",
+                    "anthropic/claude-opus-4",
+                    "google/gemini-2.5-pro",
+                    "openai/gpt-4.1",
+                ]
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+            },
+            // === API Key 供应商 ===
+            ProviderTemplate {
+                id: "openai".into(),
+                name: "OpenAI".into(),
+                prefix: "oai".into(),
+                default_base_url: "https://api.openai.com".into(),
+                api_format: ApiFormat::OpenAI,
+                auth_type: AuthType::ApiKey,
+                oauth: None,
+                headers: HashMap::new(),
+                auth_header: "Authorization".into(),
+                auth_prefix: Some("Bearer".into()),
+                models: vec![
+                    "gpt-4o",
+                    "gpt-4o-mini",
+                    "gpt-4-turbo",
+                    "gpt-4",
+                    "gpt-3.5-turbo",
+                    "o1",
+                    "o1-mini",
+                ]
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+            },
+            ProviderTemplate {
+                id: "anthropic".into(),
+                name: "Anthropic (Claude)".into(),
+                prefix: "ant".into(),
+                default_base_url: "https://api.anthropic.com".into(),
+                api_format: ApiFormat::Claude,
+                auth_type: AuthType::ApiKey,
+                oauth: None,
+                headers: vec![("Anthropic-Version".into(), "2023-06-01".into())]
+                    .into_iter()
+                    .collect(),
+                auth_header: "x-api-key".into(),
+                auth_prefix: None,
+                models: vec![
+                    "claude-3-5-sonnet-20241022",
+                    "claude-3-5-haiku-20241022",
+                    "claude-3-opus-20240229",
+                ]
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+            },
+            ProviderTemplate {
+                id: "deepseek".into(),
+                name: "DeepSeek".into(),
+                prefix: "ds".into(),
+                default_base_url: "https://api.deepseek.com".into(),
+                api_format: ApiFormat::OpenAI,
+                auth_type: AuthType::ApiKey,
+                oauth: None,
+                headers: HashMap::new(),
+                auth_header: "Authorization".into(),
+                auth_prefix: Some("Bearer".into()),
+                models: vec!["deepseek-chat", "deepseek-reasoner"]
+                    .into_iter()
+                    .map(Into::into)
+                    .collect(),
+            },
+            ProviderTemplate {
+                id: "google".into(),
+                name: "Google AI (Gemini)".into(),
+                prefix: "gc".into(),
+                default_base_url: "https://generativelanguage.googleapis.com".into(),
+                api_format: ApiFormat::Gemini,
+                auth_type: AuthType::ApiKey,
+                oauth: None,
+                headers: HashMap::new(),
+                auth_header: "x-goog-api-key".into(),
+                auth_prefix: None,
+                models: vec!["gemini-2.0-flash", "gemini-1.5-pro", "gemini-1.5-flash"]
+                    .into_iter()
+                    .map(Into::into)
+                    .collect(),
+            },
+            ProviderTemplate {
+                id: "qianfan".into(),
+                name: "百度千帆".into(),
+                prefix: "qf".into(),
+                default_base_url: "https://qianfan.baidubce.com/v2".into(),
+                api_format: ApiFormat::OpenAI,
+                auth_type: AuthType::ApiKey,
+                oauth: None,
+                headers: HashMap::new(),
+                auth_header: "Authorization".into(),
+                auth_prefix: Some("Bearer".into()),
+                models: vec!["*"].into_iter().map(Into::into).collect(),
+            },
+            ProviderTemplate {
+                id: "siliconflow".into(),
+                name: "SiliconFlow".into(),
+                prefix: "sf".into(),
+                default_base_url: "https://api.siliconflow.cn/v1".into(),
+                api_format: ApiFormat::OpenAI,
+                auth_type: AuthType::ApiKey,
+                oauth: None,
+                headers: HashMap::new(),
+                auth_header: "Authorization".into(),
+                auth_prefix: Some("Bearer".into()),
+                models: vec!["*"].into_iter().map(Into::into).collect(),
+            },
+            ProviderTemplate {
+                id: "openrouter".into(),
+                name: "OpenRouter".into(),
+                prefix: "or".into(),
+                default_base_url: "https://openrouter.ai/api".into(),
+                api_format: ApiFormat::OpenAI,
+                auth_type: AuthType::ApiKey,
+                oauth: None,
+                headers: HashMap::new(),
+                auth_header: "Authorization".into(),
+                auth_prefix: Some("Bearer".into()),
+                models: vec!["*"].into_iter().map(Into::into).collect(),
+            },
+            ProviderTemplate {
+                id: "moonshot".into(),
+                name: "Moonshot AI (Kimi)".into(),
+                prefix: "ms".into(),
+                default_base_url: "https://api.moonshot.cn".into(),
+                api_format: ApiFormat::OpenAI,
+                auth_type: AuthType::ApiKey,
+                oauth: None,
+                headers: HashMap::new(),
+                auth_header: "Authorization".into(),
+                auth_prefix: Some("Bearer".into()),
+                models: vec!["moonshot-v1-8k", "moonshot-v1-32k", "moonshot-v1-128k"]
+                    .into_iter()
+                    .map(Into::into)
+                    .collect(),
+            },
+            ProviderTemplate {
+                id: "zhipu".into(),
+                name: "智谱 AI (GLM)".into(),
+                prefix: "zp".into(),
+                default_base_url: "https://open.bigmodel.cn".into(),
+                api_format: ApiFormat::OpenAI,
+                auth_type: AuthType::ApiKey,
+                oauth: None,
+                headers: HashMap::new(),
+                auth_header: "Authorization".into(),
+                auth_prefix: Some("Bearer".into()),
+                models: vec!["glm-4", "glm-4-flash", "glm-4-plus"]
+                    .into_iter()
+                    .map(Into::into)
+                    .collect(),
+            },
+            ProviderTemplate {
+                id: "qwen".into(),
+                name: "阿里云通义千问".into(),
+                prefix: "qw".into(),
+                default_base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1".into(),
+                api_format: ApiFormat::OpenAI,
+                auth_type: AuthType::ApiKey,
+                oauth: None,
+                headers: HashMap::new(),
+                auth_header: "Authorization".into(),
+                auth_prefix: Some("Bearer".into()),
+                models: vec!["qwen-turbo", "qwen-plus", "qwen-max"]
+                    .into_iter()
+                    .map(Into::into)
+                    .collect(),
+            },
+            ProviderTemplate {
+                id: "groq".into(),
+                name: "Groq".into(),
+                prefix: "gq".into(),
+                default_base_url: "https://api.groq.com".into(),
+                api_format: ApiFormat::OpenAI,
+                auth_type: AuthType::ApiKey,
+                oauth: None,
+                headers: HashMap::new(),
+                auth_header: "Authorization".into(),
+                auth_prefix: Some("Bearer".into()),
+                models: vec!["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
+                    .into_iter()
+                    .map(Into::into)
+                    .collect(),
+            },
+            ProviderTemplate {
+                id: "mistral".into(),
+                name: "Mistral AI".into(),
+                prefix: "mr".into(),
+                default_base_url: "https://api.mistral.ai".into(),
+                api_format: ApiFormat::OpenAI,
+                auth_type: AuthType::ApiKey,
+                oauth: None,
+                headers: HashMap::new(),
+                auth_header: "Authorization".into(),
+                auth_prefix: Some("Bearer".into()),
+                models: vec!["mistral-large-latest", "codestral-latest"]
+                    .into_iter()
+                    .map(Into::into)
+                    .collect(),
+            },
+            ProviderTemplate {
+                id: "api2d".into(),
+                name: "API2D".into(),
+                prefix: "a2d".into(),
+                default_base_url: "https://oa.api2d.net".into(),
+                api_format: ApiFormat::OpenAI,
+                auth_type: AuthType::ApiKey,
+                oauth: None,
+                headers: HashMap::new(),
+                auth_header: "Authorization".into(),
+                auth_prefix: Some("Bearer".into()),
+                models: vec!["*"].into_iter().map(Into::into).collect(),
+            },
+        ]
+    }
+}
+
+/// 内置 Provider 模板（只读）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderTemplate {
+    pub id: String,
+    pub name: String,
+    pub prefix: String,
+    pub default_base_url: String,
+    pub api_format: ApiFormat,
+    /// 认证类型
+    pub auth_type: AuthType,
+    /// OAuth 配置
+    pub oauth: Option<OAuthConfig>,
+    /// 额外请求头
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+    /// 认证头名称
+    pub auth_header: String,
+    /// 认证前缀
+    #[serde(default)]
+    pub auth_prefix: Option<String>,
+    pub models: Vec<String>,
+}
+
+// ============ Group（路由组） ============
+
+/// Group 策略
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GroupStrategy {
+    Priority,      // 按优先级顺序
+    Weighted,      // 按权重随机
+    RoundRobin,    // 轮询
+    Random,        // 随机打乱
+    LeastUsed,     // 最少使用优先
+    CostOptimized, // 成本优化
+}
+
+impl Default for GroupStrategy {
+    fn default() -> Self {
+        Self::Priority
+    }
+}
+
+/// Group 中的模型项
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GroupModel {
+    pub model: String, // 格式: "provider/model" 或 "model"
+    pub weight: u32,   // 权重（用于 weighted 策略）
+    pub priority: u32, // 优先级（数字越小越优先）
+}
+
+impl GroupModel {
+    pub fn new(model: String) -> Self {
+        Self {
+            model,
+            weight: 1,
+            priority: 0,
+        }
+    }
+
+    pub fn with_priority(mut self, priority: u32) -> Self {
+        self.priority = priority;
+        self
+    }
+
+    pub fn with_weight(mut self, weight: u32) -> Self {
+        self.weight = weight;
+        self
+    }
+}
+
+/// Group 配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GroupConfig {
+    #[serde(default = "default_max_retries")]
+    pub max_retries: u32,
+    #[serde(default = "default_retry_delay")]
+    pub retry_delay_ms: u32,
+    #[serde(default)]
+    pub timeout_ms: Option<u32>,
+}
+
+fn default_max_retries() -> u32 {
+    3
+}
+fn default_retry_delay() -> u32 {
+    1000
+}
+
+impl Default for GroupConfig {
+    fn default() -> Self {
+        Self {
+            max_retries: 3,
+            retry_delay_ms: 1000,
+            timeout_ms: None,
+        }
+    }
+}
+
+/// Group（路由组）
+///
+/// 示例：
+/// ```text
+/// Group {
+///     name: "gpt-4",
+///     models: [
+///         GroupModel { model: "openai/gpt-4", priority: 0 },
+///         GroupModel { model: "azure/gpt-4", priority: 1 },
+///         GroupModel { model: "api2d/gpt-4", priority: 2 },
+///     ],
+///     strategy: Priority,
+/// }
+/// ```
+///
+/// 请求 model="gpt-4" 时，按优先级依次尝试 openai、azure、api2d
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Group {
+    pub id: String,
+    pub name: String, // Group 名称，请求时使用
+    pub description: Option<String>,
+    pub models: Vec<GroupModel>, // 模型列表
+    pub strategy: GroupStrategy,
+    pub config: GroupConfig,
+    pub is_active: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl Group {
+    pub fn new(name: String) -> Self {
+        let now = Utc::now();
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            name,
+            description: None,
+            models: Vec::new(),
+            strategy: GroupStrategy::default(),
+            config: GroupConfig::default(),
+            is_active: true,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    pub fn add_model(&mut self, model: GroupModel) {
+        self.models.push(model);
+        self.updated_at = Utc::now();
+    }
+
+    /// 获取排序后的模型列表（按策略）
+    pub fn get_ordered_models(&self) -> Vec<&GroupModel> {
+        let mut models: Vec<_> = self.models.iter().collect();
+        match self.strategy {
+            GroupStrategy::Priority => {
+                models.sort_by_key(|m| m.priority);
+            }
+            GroupStrategy::Weighted | GroupStrategy::Random => {
+                // 保持原顺序或随机
+            }
+            GroupStrategy::RoundRobin => {
+                // TODO: 需要维护状态
+                models.sort_by_key(|m| m.priority);
+            }
+            GroupStrategy::LeastUsed | GroupStrategy::CostOptimized => {
+                // TODO: 需要实际数据
+                models.sort_by_key(|m| m.priority);
+            }
+        }
+        models
+    }
+}
+
+// ============ 模型映射（可选） ============
+
+/// 模型名模式 → Group 映射
+///
+/// 支持通配符：
+/// - "claude-*" → 匹配所有 claude 开头的模型
+/// - "gpt-4*" → 匹配 gpt-4, gpt-4-turbo, gpt-4o 等
+/// - "*" → 默认兜底
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelMapping {
+    pub id: String,
+    pub pattern: String,  // glob 模式
+    pub group_id: String, // 指向的 Group
+    pub priority: u32,    // 匹配优先级（数字越小越优先）
+}
+
+impl ModelMapping {
+    pub fn new(pattern: String, group_id: String) -> Self {
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            pattern,
+            group_id,
+            priority: 0,
+        }
+    }
+
+    /// 检查模型名是否匹配此模式
+    pub fn matches(&self, model: &str) -> bool {
+        if self.pattern == "*" {
+            return true;
+        }
+        if self.pattern.ends_with('*') {
+            let prefix = &self.pattern[..self.pattern.len() - 1];
+            return model.starts_with(prefix);
+        }
+        if self.pattern.starts_with('*') {
+            let suffix = &self.pattern[1..];
+            return model.ends_with(suffix);
+        }
+        self.pattern == model
+    }
+}
+
+// ============ 请求/响应模型 ============
+
+/// 消息内容
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum MessageContent {
+    Text(String),
+    Parts(Vec<ContentPart>),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContentPart {
+    #[serde(rename = "type")]
+    pub content_type: String,
+    #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub image_url: Option<ImageUrl>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageUrl {
+    pub url: String,
+    #[serde(default)]
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Tool {
+    #[serde(rename = "type")]
+    pub tool_type: String,
+    pub function: ToolFunction,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolFunction {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub parameters: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCall {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub call_type: String,
+    pub function: FunctionCall,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FunctionCall {
+    pub name: String,
+    pub arguments: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Message {
+    pub role: String,
+    pub content: MessageContent,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub tool_calls: Vec<ToolCall>,
+    #[serde(default)]
+    pub tool_call_id: Option<String>,
+}
+
+/// 聊天请求
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatRequest {
+    pub model: String,
+    pub messages: Vec<Message>,
+    #[serde(default)]
+    pub stream: bool,
+    #[serde(default)]
+    pub temperature: Option<f32>,
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
+    #[serde(default)]
+    pub tools: Vec<Tool>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
+}
+
+// ============ Responses API（OpenAI 新 API） ============
+
+/// Responses API 请求
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResponsesRequest {
+    pub model: String,
+    pub input: ResponsesInput,
+    #[serde(default)]
+    pub stream: bool,
+    #[serde(default)]
+    pub temperature: Option<f32>,
+    #[serde(default)]
+    pub max_output_tokens: Option<u32>,
+    #[serde(default)]
+    pub tools: Option<Vec<ResponsesTool>>,
+    #[serde(default)]
+    pub instructions: Option<String>,
+    #[serde(default)]
+    pub parallel_tool_calls: Option<bool>,
+    #[serde(default)]
+    pub truncation: Option<String>,
+    #[serde(default)]
+    pub store: Option<bool>,
+    #[serde(default)]
+    pub metadata: Option<HashMap<String, serde_json::Value>>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
+}
+
+/// Responses API 输入（可以是字符串或消息数组）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ResponsesInput {
+    Text(String),
+    Items(Vec<ResponsesInputItem>),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResponsesInputItem {
+    #[serde(rename = "type")]
+    pub item_type: String,
+    #[serde(default)]
+    pub role: Option<String>,
+    #[serde(default)]
+    pub content: Option<serde_json::Value>,
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResponsesTool {
+    #[serde(rename = "type")]
+    pub tool_type: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub parameters: Option<serde_json::Value>,
+}
+
+/// Responses API 响应
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResponsesResponse {
+    pub id: String,
+    pub object: String,
+    pub created_at: Option<i64>,
+    pub status: String,
+    pub error: Option<serde_json::Value>,
+    pub incomplete_details: Option<serde_json::Value>,
+    pub instructions: Option<String>,
+    pub max_output_tokens: Option<u32>,
+    pub model: String,
+    pub output: Vec<ResponsesOutputItem>,
+    pub parallel_tool_calls: Option<bool>,
+    pub temperature: Option<f32>,
+    pub tool_choice: Option<serde_json::Value>,
+    pub tools: Option<Vec<ResponsesTool>>,
+    pub top_p: Option<f32>,
+    pub usage: Option<ResponsesUsage>,
+    pub user: Option<String>,
+    pub metadata: Option<HashMap<String, serde_json::Value>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResponsesOutputItem {
+    #[serde(rename = "type")]
+    pub output_type: String,
+    pub id: Option<String>,
+    pub status: Option<String>,
+    pub role: Option<String>,
+    pub content: Option<Vec<ResponsesOutputContent>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResponsesOutputContent {
+    #[serde(rename = "type")]
+    pub content_type: String,
+    #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub annotations: Option<Vec<serde_json::Value>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResponsesUsage {
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub total_tokens: Option<i64>,
+    pub output_token_details: Option<serde_json::Value>,
+}
+
+// ============ Embeddings 模型 ============
+
+/// Embedding 请求
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbeddingRequest {
+    pub model: String,
+    pub input: EmbeddingInput,
+    #[serde(default)]
+    pub encoding_format: Option<String>,
+    #[serde(default)]
+    pub dimensions: Option<u32>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
+}
+
+/// Embedding 输入（可以是字符串或字符串数组）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum EmbeddingInput {
+    Single(String),
+    Multiple(Vec<String>),
+}
+
+impl EmbeddingInput {
+    pub fn as_texts(&self) -> Vec<String> {
+        match self {
+            EmbeddingInput::Single(s) => vec![s.clone()],
+            EmbeddingInput::Multiple(arr) => arr.clone(),
+        }
+    }
+}
+
+/// Embedding 响应
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbeddingResponse {
+    pub object: String,
+    pub data: Vec<EmbeddingData>,
+    pub model: String,
+    pub usage: EmbeddingUsage,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbeddingData {
+    pub object: String,
+    pub embedding: Vec<f32>,
+    pub index: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbeddingUsage {
+    pub prompt_tokens: usize,
+    pub total_tokens: usize,
+}
+
+// ============ Claude Messages 模型 ============
+
+/// Claude Messages 请求
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClaudeMessagesRequest {
+    pub model: String,
+    pub max_tokens: u32,
+    pub messages: Vec<ClaudeMessage>,
+    #[serde(default)]
+    pub system: Option<Vec<ClaudeSystemBlock>>,
+    #[serde(default)]
+    pub stream: bool,
+    #[serde(default)]
+    pub temperature: Option<f32>,
+    #[serde(default)]
+    pub top_p: Option<f32>,
+    #[serde(default)]
+    pub tools: Option<Vec<ClaudeTool>>,
+    #[serde(default)]
+    pub tool_choice: Option<serde_json::Value>,
+    #[serde(default)]
+    pub stop_sequences: Option<Vec<String>>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClaudeMessage {
+    pub role: String,
+    pub content: ClaudeContent,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ClaudeContent {
+    Text(String),
+    Blocks(Vec<ClaudeContentBlock>),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClaudeContentBlock {
+    #[serde(rename = "type")]
+    pub block_type: String,
+    #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub source: Option<ClaudeImageSource>,
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub input: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClaudeImageSource {
+    #[serde(rename = "type")]
+    pub source_type: String,
+    pub media_type: String,
+    pub data: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClaudeSystemBlock {
+    #[serde(rename = "type")]
+    pub block_type: String,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClaudeTool {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    pub input_schema: serde_json::Value,
+}
+
+/// Claude Messages 响应
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClaudeMessagesResponse {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub response_type: String,
+    pub role: String,
+    pub content: Vec<ClaudeContentBlock>,
+    pub model: String,
+    pub stop_reason: Option<String>,
+    pub stop_sequence: Option<String>,
+    pub usage: ClaudeUsage,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClaudeUsage {
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+    #[serde(default)]
+    pub cache_creation_input_tokens: Option<u32>,
+    #[serde(default)]
+    pub cache_read_input_tokens: Option<u32>,
+}
+
+// ============ 请求日志 ============
+
+/// 请求日志
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RequestLog {
+    pub id: i64,
+    pub timestamp: DateTime<Utc>,
+    pub method: String,
+    pub path: String,
+    /// 用户请求的模型名（可能是 Group 名称）
+    pub requested_model: Option<String>,
+    /// 实际使用的模型名
+    pub model: Option<String>,
+    /// Provider 名称
+    pub provider: Option<String>,
+    /// Provider 前缀
+    pub provider_prefix: Option<String>,
+    /// 实际请求的 URL
+    pub url: Option<String>,
+    /// 协议转换类型: "direct" 直发, "OpenAI->Claude" 等
+    pub protocol_transform: Option<String>,
+    pub status_code: i32,
+    pub latency_ms: i64,
+    /// 首 token 延迟（流式请求）
+    pub first_token_ms: Option<i64>,
+    pub prompt_tokens: Option<i32>,
+    pub completion_tokens: Option<i32>,
+    /// 请求成本（美元）
+    pub cost: Option<f64>,
+    pub error: Option<String>,
+    pub request_body: Option<String>,
+    pub response_body: Option<String>,
+}
+
+impl RequestLog {
+    pub fn new(method: String, path: String) -> Self {
+        Self {
+            id: 0,
+            timestamp: Utc::now(),
+            method,
+            path,
+            requested_model: None,
+            model: None,
+            provider: None,
+            provider_prefix: None,
+            url: None,
+            protocol_transform: None,
+            status_code: 0,
+            latency_ms: 0,
+            first_token_ms: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+            cost: None,
+            error: None,
+            request_body: None,
+            response_body: None,
+        }
+    }
+
+    pub fn with_requested_model(mut self, model: String) -> Self {
+        self.requested_model = Some(model);
+        self
+    }
+
+    pub fn with_model(mut self, model: String) -> Self {
+        self.model = Some(model);
+        self
+    }
+
+    pub fn with_provider(mut self, name: String, prefix: String) -> Self {
+        self.provider = Some(name);
+        self.provider_prefix = Some(prefix);
+        self
+    }
+
+    pub fn with_url(mut self, url: String) -> Self {
+        self.url = Some(url);
+        self
+    }
+
+    pub fn with_protocol_transform(mut self, transform: String) -> Self {
+        self.protocol_transform = Some(transform);
+        self
+    }
+
+    pub fn with_status(mut self, status: i32) -> Self {
+        self.status_code = status;
+        self
+    }
+
+    pub fn with_latency(mut self, ms: i64) -> Self {
+        self.latency_ms = ms;
+        self
+    }
+
+    pub fn with_first_token(mut self, ms: i64) -> Self {
+        self.first_token_ms = Some(ms);
+        self
+    }
+
+    pub fn with_tokens(mut self, prompt: i32, completion: i32) -> Self {
+        self.prompt_tokens = Some(prompt);
+        self.completion_tokens = Some(completion);
+        self
+    }
+
+    pub fn with_cost(mut self, cost: f64) -> Self {
+        self.cost = Some(cost);
+        self
+    }
+
+    pub fn with_error(mut self, error: String) -> Self {
+        self.error = Some(error);
+        self
+    }
+
+    pub fn with_request(mut self, body: String) -> Self {
+        self.request_body = Some(body);
+        self
+    }
+
+    pub fn with_response(mut self, body: String) -> Self {
+        self.response_body = Some(body);
+        self
+    }
+}
