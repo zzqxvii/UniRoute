@@ -702,11 +702,45 @@ pub enum EmbeddingInput {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Tool {
-    #[serde(rename = "type")] pub tool_type: String,
+    #[serde(rename = "type", default = "default_tool_type")]
+    pub tool_type: String,
     #[serde(default)]
     pub function: Option<ToolFunction>,
+    /// 捕获额外字段（兼容旧版 functions 格式）
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+fn default_tool_type() -> String { "function".to_string() }
+
+impl Tool {
+    /// 规范化 Tool，处理旧版 functions 格式
+    pub fn normalize(&self) -> Self {
+        // 如果已经有 function 字段，直接返回
+        if self.function.is_some() {
+            return self.clone();
+        }
+        
+        // 尝试从 extra 中提取旧版格式字段
+        let name = self.extra.get("name").and_then(|v| v.as_str());
+        let description = self.extra.get("description").and_then(|v| v.as_str());
+        let parameters = self.extra.get("parameters").cloned();
+        
+        if let Some(name) = name {
+            let function = ToolFunction {
+                name: name.to_string(),
+                description: description.map(|s| s.to_string()),
+                parameters,
+            };
+            Tool {
+                tool_type: "function".to_string(),
+                function: Some(function),
+                extra: serde_json::Map::new(),
+            }
+        } else {
+            self.clone()
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

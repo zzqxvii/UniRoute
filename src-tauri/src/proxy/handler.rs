@@ -504,6 +504,7 @@ pub async fn handle_chat_completions(
                     log_entry = log_entry
                         .with_status(status.as_u16() as i32)
                         .with_latency(latency)
+                        .with_original_response(serde_json::to_string(&response_json).unwrap_or_default())
                         .with_response(serde_json::to_string(&response_json).unwrap_or_default())
                         .with_error(error.to_string());
                     state.save_request_log(&log_entry);
@@ -871,6 +872,7 @@ pub async fn handle_responses(
                     log_entry = log_entry
                         .with_status(status.as_u16() as i32)
                         .with_latency(latency)
+                        .with_original_response(serde_json::to_string(&response_json).unwrap_or_default())
                         .with_response(serde_json::to_string(&response_json).unwrap_or_default())
                         .with_error(error.to_string());
                     state.save_request_log(&log_entry);

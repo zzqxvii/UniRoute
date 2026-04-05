@@ -1387,7 +1387,9 @@ pub fn responses_to_chat_request(responses_req: &ResponsesRequest) -> ChatReques
                 })
                 .collect();
             
-            let tools = responses_req.tools.clone();
+            let tools: Vec<crate::models::Tool> = responses_req.tools.iter()
+                .map(|t| t.normalize())
+                .collect();
             
             return ChatRequest {
                 model: responses_req.model.clone(),
@@ -1531,7 +1533,9 @@ pub fn responses_to_chat_request(responses_req: &ResponsesRequest) -> ChatReques
         }
     };
 
-    let tools = responses_req.tools.clone();
+    let tools: Vec<crate::models::Tool> = responses_req.tools.iter()
+        .map(|t| t.normalize())
+        .collect();
 
     ChatRequest {
         model: responses_req.model.clone(),
