@@ -1388,6 +1388,7 @@ pub fn responses_to_chat_request(responses_req: &ResponsesRequest) -> ChatReques
                 .collect();
             
             let tools: Vec<crate::models::Tool> = responses_req.tools.iter()
+                .filter(|t| t.tool_type == "function" || t.function.is_some())
                 .map(|t| {
                     let normalized = t.normalize();
                     tracing::debug!(
@@ -1543,6 +1544,7 @@ pub fn responses_to_chat_request(responses_req: &ResponsesRequest) -> ChatReques
     };
 
     let tools: Vec<crate::models::Tool> = responses_req.tools.iter()
+        .filter(|t| t.tool_type == "function" || t.function.is_some())
         .map(|t| t.normalize())
         .collect();
 
