@@ -1388,8 +1388,17 @@ pub fn responses_to_chat_request(responses_req: &ResponsesRequest) -> ChatReques
                 .collect();
             
             let tools: Vec<crate::models::Tool> = responses_req.tools.iter()
-                .map(|t| t.normalize())
+                .map(|t| {
+                    let normalized = t.normalize();
+                    tracing::debug!(
+                        "Tool normalize: before tool_type={}, function={:?}, after tool_type={}, function={:?}",
+                        t.tool_type, t.function, normalized.tool_type, normalized.function
+                    );
+                    normalized
+                })
                 .collect();
+            
+            tracing::info!("Normalized tools count: {}, first tool: {:?}", tools.len(), tools.first());
             
             return ChatRequest {
                 model: responses_req.model.clone(),
