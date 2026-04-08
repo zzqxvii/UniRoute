@@ -10,7 +10,7 @@ use serde_json::json;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Mutex;
-use crate::models::{ChatRequest, ClaudeMessagesRequest, ClaudeContent, EmbeddingRequest, Message, MessageContent};
+use crate::models::{ChatRequest, EmbeddingRequest};
 use crate::router::{Router, chat_to_responses_response};
 use crate::state::AppState;
 use crate::models::RequestLog;
@@ -114,6 +114,13 @@ impl SseUsageCollector {
                 if let Some(c) = usage.get("completion_tokens").and_then(|v| v.as_i64()) {
                     completion_tokens = c as i32;
                 }
+                // Claude 格式的 usage (input_tokens, output_tokens)
+                if let Some(p) = usage.get("input_tokens").and_then(|v| v.as_i64()) {
+                    prompt_tokens = p as i32;
+                }
+                if let Some(c) = usage.get("output_tokens").and_then(|v| v.as_i64()) {
+                    completion_tokens = c as i32;
+                }
             }
 
             // 某些供应商在最后一个 chunk 中附带 usage
@@ -126,7 +133,7 @@ impl SseUsageCollector {
                 }
             }
 
-            // 提取内容（从 delta.content）
+            // 提取内容（OpenAI 格式：从 delta.content）
             if let Some(choices) = event.get("choices").and_then(|c| c.as_array()) {
                 for choice in choices {
                     if let Some(delta) = choice.get("delta") {
@@ -139,6 +146,18 @@ impl SseUsageCollector {
                             accumulated_reasoning.push_str(reasoning);
                         }
                     }
+                }
+            }
+
+            // 提取内容（Claude 格式：从 delta.text）
+            if let Some(delta) = event.get("delta") {
+                // 普通文本内容
+                if let Some(text) = delta.get("text").and_then(|t| t.as_str()) {
+                    accumulated_content.push_str(text);
+                }
+                // thinking 内容
+                if let Some(thinking) = delta.get("thinking").and_then(|t| t.as_str()) {
+                    accumulated_reasoning.push_str(thinking);
                 }
             }
         }
@@ -1735,6 +1754,7 @@ fn responses_error(status: u16, message: impl Into<String>) -> Response {
 }
 
 /// Handle Claude-compatible messages
+/// 直连模式：直接转发原始请求到上游的 /v1/messages 端点，不做格式转换
 pub async fn handle_claude_messages(
     State(state): State<Arc<AppState>>,
     request: Request,
@@ -1756,9 +1776,10 @@ pub async fn handle_claude_messages(
     };
 
     let request_body_str = String::from_utf8_lossy(&body).to_string();
-    log_entry = log_entry.with_request(request_body_str.clone());
+    // 保存原始请求（客户端发送的）
+    log_entry = log_entry.with_original_request(request_body_str.clone());
 
-    // 直接解析为 JSON Value，避免严格结构体解析问题
+    // 直接解析为 JSON Value
     let raw_body: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
@@ -1776,11 +1797,10 @@ pub async fn handle_claude_messages(
         .to_string();
     log_entry = log_entry.with_requested_model(requested_model.clone());
 
-    // 将 Claude 格式转换为 OpenAI 格式后路由
-    let chat_request = claude_value_to_chat_request(&raw_body);
-
+    // ===== 直连模式：直接转发原始请求 =====
+    // 不做格式转换，直接路由原始 JSON 请求
     let router = Router::new(Arc::clone(&state));
-    let route_result = router.route_chat(chat_request).await;
+    let route_result = router.route_claude_messages_raw(&raw_body).await;
 
     let info = route_result.info.clone();
 
@@ -1799,62 +1819,152 @@ pub async fn handle_claude_messages(
         log_entry = log_entry.with_protocol_transform(transform.clone());
     }
 
+    // 保存实际发送的请求体
+    if let Some(ref actual_body) = route_result.actual_request_body {
+        if let Ok(body_str) = serde_json::to_string(actual_body) {
+            log_entry = log_entry.with_request(body_str);
+        }
+    }
+
     match (route_result.response, route_result.error) {
         (Some(response), None) => {
             let status = response.status();
-            let body_bytes = match response.bytes().await {
-                Ok(b) => b,
-                Err(e) => {
-                    log_entry = log_entry
-                        .with_status(500)
-                        .with_error(format!("读取响应失败: {}", e));
-                    state.save_request_log(&log_entry);
-                    return claude_error(500, format!("Failed to read response: {}", e));
-                }
-            };
 
-            let response_json: serde_json::Value = match serde_json::from_slice(&body_bytes) {
-                Ok(v) => v,
-                Err(_) => {
-                    let body_text = String::from_utf8_lossy(&body_bytes);
-                    log_entry = log_entry
-                        .with_status(200)
-                        .with_response(body_text.to_string());
-                    state.save_request_log(&log_entry);
-                    return claude_error(500, "Provider returned non-JSON response");
-                }
-            };
+            if is_sse_response(&response) {
+                // 流式响应：透传 SSE 流并收集 usage
+                tracing::info!(
+                    "Claude Messages 流式响应: requested='{}', actual='{}', provider='{}'",
+                    info.requested_model,
+                    info.actual_model.as_deref().unwrap_or("-"),
+                    info.provider_name.as_deref().unwrap_or("-")
+                );
 
-            // 将 OpenAI 格式响应转换为 Claude 格式
-            let claude_response = openai_to_claude_response(&response_json, &requested_model);
+                let mut builder = Response::builder().status(status.as_u16());
 
-            let latency = start_time.elapsed().as_millis() as i64;
-            log_entry = log_entry
-                .with_status(status.as_u16() as i32)
-                .with_latency(latency)
-                .with_response(serde_json::to_string(&claude_response).unwrap_or_default());
-
-            if let Some(usage) = claude_response.get("usage") {
-                if let Some(prompt) = usage.get("input_tokens").and_then(|v| v.as_u64()) {
-                    if let Some(completion) = usage.get("output_tokens").and_then(|v| v.as_u64()) {
-                        log_entry = log_entry.with_tokens(prompt as i32, completion as i32);
+                // 复制响应头
+                for (key, value) in response.headers() {
+                    let key_str = key.as_str();
+                    if !matches!(key_str, "content-encoding" | "content-length" | "transfer-encoding") {
+                        builder = builder.header(key, value);
                     }
                 }
-            }
 
-            state.save_request_log(&log_entry);
+                // 创建使用量收集器（支持 OpenAI 和 Claude 格式）
+                let state_clone = Arc::clone(&state);
+                let log_entry_base = log_entry.clone();
+                let model_for_cost = info.actual_model.clone();
+                let provider_for_cost = info.provider_prefix.as_ref()
+                    .and_then(|prefix| state.get_provider_by_prefix(prefix));
+                let provider_prefix_for_cost = provider_for_cost.as_ref().map(|p| p.prefix.clone());
+                let pricing_manager = Arc::clone(&state.pricing_manager);
+                let collector = Arc::new(SseUsageCollector::new(start_time, move |events, latency_ms, first_token_ms, prompt_tokens, completion_tokens, full_content| {
+                    let mut final_log = log_entry_base.clone();
+                    final_log = final_log
+                        .with_status(200)
+                        .with_latency(latency_ms);
 
-            let mut resp_builder = Response::builder()
-                .status(status.as_u16())
-                .header("content-type", "application/json");
+                    if let Some(ft) = first_token_ms {
+                        final_log = final_log.with_first_token(ft);
+                    }
 
-            if let Some(req_id) = claude_response.get("id").and_then(|v| v.as_str()) {
-                resp_builder = resp_builder.header("request-id", req_id);
-            }
+                    if prompt_tokens > 0 || completion_tokens > 0 {
+                        final_log = final_log.with_tokens(prompt_tokens, completion_tokens);
+                        tracing::info!("Claude 流式响应提取到 tokens: prompt={}, completion={}", prompt_tokens, completion_tokens);
 
-            match resp_builder.body(Body::from(serde_json::to_string(&claude_response).unwrap_or_default())) {
-                Ok(resp) => resp.into_response(),
-                Err(e) => claude_error(500, format!("构建响应失败: {}", e)),
+                        // 计算成本
+                        if let Some(model) = &model_for_cost {
+                            let prefix_ref = provider_prefix_for_cost.as_deref();
+                            let normalized_model = normalize_model_name_with_prefix(model, prefix_ref);
+
+                            if let Some(ref provider) = provider_for_cost {
+                                if provider.enable_cost {
+                                    let pricing_opt = provider.get_model_pricing(normalized_model)
+                                        .map(|p| crate::pricing::PricingEntry::new(p.input, p.output));
+
+                                    let pricing = pricing_opt.or_else(|| {
+                                        let pm = pricing_manager.read();
+                                        pm.get_pricing(&provider.prefix, normalized_model)
+                                    });
+
+                                    if let Some(pricing) = pricing {
+                                        let cost = calculate_cost(prompt_tokens, completion_tokens, None, None, &pricing);
+                                        final_log = final_log.with_cost(cost);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // 保存最后的 SSE 事件作为响应记录
+                    if let Some(last_event) = events.last() {
+                        if let Ok(response_str) = serde_json::to_string(last_event) {
+                            final_log = final_log.with_response(response_str);
+                        }
+                    }
+
+                    let _ = state_clone.save_request_log(&final_log);
+                }));
+
+                // 创建带日志的流
+                let stream = response.bytes_stream();
+                let logged_stream = create_logged_passthrough_stream(stream, collector);
+                let body = Body::from_stream(logged_stream);
+
+                match builder.body(body) {
+                    Ok(resp) => resp,
+                    Err(e) => {
+                        log_entry = log_entry
+                            .with_status(500)
+                            .with_error(format!("构建流式响应失败: {}", e));
+                        state.save_request_log(&log_entry);
+                        return claude_error(500, format!("Failed to build streaming response: {}", e));
+                    }
+                }
+            } else {
+                // 非流式响应：直接返回
+                let body_bytes = match response.bytes().await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        log_entry = log_entry
+                            .with_status(500)
+                            .with_error(format!("读取响应失败: {}", e));
+                        state.save_request_log(&log_entry);
+                        return claude_error(500, format!("Failed to read response: {}", e));
+                    }
+                };
+
+                let latency = start_time.elapsed().as_millis() as i64;
+                log_entry = log_entry
+                    .with_status(status.as_u16() as i32)
+                    .with_latency(latency)
+                    .with_response(String::from_utf8_lossy(&body_bytes).to_string());
+
+                // 尝试从响应中提取 tokens
+                if let Ok(response_json) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
+                    if let Some(usage) = response_json.get("usage") {
+                        // OpenAI 格式
+                        if let Some(input) = usage.get("prompt_tokens").and_then(|v| v.as_i64()) {
+                            if let Some(output) = usage.get("completion_tokens").and_then(|v| v.as_i64()) {
+                                log_entry = log_entry.with_tokens(input as i32, output as i32);
+                            }
+                        }
+                        // Claude 格式
+                        if let Some(input) = usage.get("input_tokens").and_then(|v| v.as_i64()) {
+                            if let Some(output) = usage.get("output_tokens").and_then(|v| v.as_i64()) {
+                                log_entry = log_entry.with_tokens(input as i32, output as i32);
+                            }
+                        }
+                    }
+                }
+
+                state.save_request_log(&log_entry);
+
+                Response::builder()
+                    .status(status.as_u16())
+                    .header("content-type", "application/json")
+                    .body(Body::from(body_bytes))
+                    .unwrap()
+                    .into_response()
             }
         }
         (None, Some(error_msg)) => {
@@ -1876,286 +1986,6 @@ pub async fn handle_claude_messages(
             claude_error(500, "Unknown error")
         }
     }
-}
-
-/// 将 Claude Messages 请求转换为 OpenAI Chat 请求
-/// 将 Claude 格式的 JSON Value 转换为 ChatRequest
-fn claude_value_to_chat_request(value: &serde_json::Value) -> ChatRequest {
-    let model = value.get("model")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown")
-        .to_string();
-    
-    let mut messages = Vec::new();
-
-    // 处理 system (可能是字符串或数组)
-    if let Some(system) = value.get("system") {
-        let system_text = if let Some(s) = system.as_str() {
-            s.to_string()
-        } else if let Some(arr) = system.as_array() {
-            arr.iter()
-                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
-                .collect::<Vec<_>>()
-                .join("\n\n")
-        } else {
-            String::new()
-        };
-        
-        if !system_text.is_empty() {
-            messages.push(Message {
-                role: "system".to_string(),
-                content: MessageContent::Text(system_text),
-                name: None,
-                tool_calls: Vec::new(),
-                tool_call_id: None,
-            });
-        }
-    }
-
-    // 处理 messages
-    if let Some(msgs) = value.get("messages").and_then(|m| m.as_array()) {
-        for msg in msgs {
-            let role = msg.get("role")
-                .and_then(|r| r.as_str())
-                .unwrap_or("user")
-                .to_string();
-            
-            // content 可能是字符串或数组
-            let content = if let Some(text) = msg.get("content").and_then(|c| c.as_str()) {
-                MessageContent::Text(text.to_string())
-            } else if let Some(parts) = msg.get("content").and_then(|c| c.as_array()) {
-                let content_parts: Vec<crate::models::ContentPart> = parts
-                    .iter()
-                    .filter_map(|p| {
-                        let content_type = p.get("type").and_then(|t| t.as_str()).unwrap_or("text");
-                        if content_type == "text" {
-                            Some(crate::models::ContentPart {
-                                content_type: "text".to_string(),
-                                text: p.get("text").and_then(|t| t.as_str()).map(|s| s.to_string()),
-                                image_url: None,
-                                extra: serde_json::Map::new(),
-                            })
-                        } else if content_type == "image" || content_type == "image_url" {
-                            let url = p.get("image_url")
-                                .and_then(|iu| iu.get("url"))
-                                .and_then(|u| u.as_str())
-                                .map(|s| s.to_string())
-                                .or_else(|| {
-                                    // Claude 格式: source.data
-                                    p.get("source").and_then(|s| {
-                                        let media_type = s.get("media_type").and_then(|m| m.as_str()).unwrap_or("image/png");
-                                        let data = s.get("data").and_then(|d| d.as_str()).unwrap_or("");
-                                        Some(format!("data:{};base64,{}", media_type, data))
-                                    })
-                                });
-                            
-                            Some(crate::models::ContentPart {
-                                content_type: "image_url".to_string(),
-                                text: None,
-                                image_url: url.map(|u| crate::models::ImageUrl { url: u, detail: None }),
-                                extra: serde_json::Map::new(),
-                            })
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                MessageContent::Parts(content_parts)
-            } else {
-                MessageContent::Text(String::new())
-            };
-
-            messages.push(Message {
-                role,
-                content,
-                name: None,
-                tool_calls: Vec::new(),
-                tool_call_id: None,
-            });
-        }
-    }
-
-    ChatRequest {
-        model,
-        messages,
-        stream: value.get("stream").and_then(|v| v.as_bool()).unwrap_or(false),
-        temperature: value.get("temperature").and_then(|v| v.as_f64()).map(|v| v as f32),
-        max_tokens: value.get("max_tokens").and_then(|v| v.as_i64()).map(|v| v as u32),
-        ..Default::default()
-    }
-}
-
-fn claude_to_chat_request(claude_req: &ClaudeMessagesRequest) -> ChatRequest {
-    let mut messages = Vec::new();
-
-    // 将 system blocks 转换为 system message
-    if let Some(system_blocks) = &claude_req.system {
-        let system_text: String = system_blocks
-            .iter()
-            .filter_map(|b| b.text.clone())
-            .collect::<Vec<_>>()
-            .join("\n\n");
-        if !system_text.is_empty() {
-            messages.push(Message {
-                role: "system".to_string(),
-                content: MessageContent::Text(system_text),
-                name: None,
-                tool_calls: Vec::new(),
-                tool_call_id: None,
-            });
-        }
-    }
-
-    // 转换消息
-    for cm in &claude_req.messages {
-        // 将 content 转换为 MessageContent
-        let content = MessageContent::Parts(
-            cm.content.iter().flat_map(|c| {
-                match c {
-                    ClaudeContent::Text { text } => {
-                        vec![crate::models::ContentPart {
-                            content_type: "text".to_string(),
-                            text: Some(text.clone()),
-                            image_url: None,
-                            extra: serde_json::Map::new(),
-                        }]
-                    }
-                    ClaudeContent::Blocks(blocks) => {
-                        blocks.iter().map(|b| {
-                            if b.block_type == "text" {
-                                crate::models::ContentPart {
-                                    content_type: "text".to_string(),
-                                    text: b.text.clone(),
-                                    image_url: None,
-                                    extra: serde_json::Map::new(),
-                                }
-                            } else if b.block_type == "image" {
-                                if let Some(ref source) = b.source {
-                                    crate::models::ContentPart {
-                                        content_type: "image_url".to_string(),
-                                        text: None,
-                                        image_url: Some(crate::models::ImageUrl {
-                                            url: format!("data:{};base64,{}", source.media_type, source.data),
-                                            detail: None,
-                                        }),
-                                        extra: serde_json::Map::new(),
-                                    }
-                                } else {
-                                    crate::models::ContentPart {
-                                        content_type: "text".to_string(),
-                                        text: Some("".to_string()),
-                                        image_url: None,
-                                        extra: serde_json::Map::new(),
-                                    }
-                                }
-                            } else {
-                                crate::models::ContentPart {
-                                    content_type: b.block_type.clone(),
-                                    text: b.text.clone(),
-                                    image_url: None,
-                                    extra: serde_json::Map::new(),
-                                }
-                            }
-                        }).collect()
-                    }
-                    _ => vec![]
-                }
-            }).collect()
-        );
-
-        messages.push(Message {
-            role: cm.role.clone(),
-            content,
-            name: None,
-            tool_calls: Vec::new(),
-            tool_call_id: None,
-        });
-    }
-
-    // 转换 tools
-    let tools = claude_req.tools.as_ref().map_or(Vec::new(), |ctools| {
-        ctools
-            .iter()
-            .map(|ct| crate::models::Tool {
-                tool_type: "function".to_string(),
-                function: Some(crate::models::ToolFunction {
-                    name: ct.name.clone(),
-                    description: ct.description.clone(),
-                    parameters: Some(ct.input_schema.clone()),
-                }),
-                extra: serde_json::Map::new(),
-            })
-            .collect()
-    });
-
-    ChatRequest {
-        model: claude_req.model.clone(),
-        messages,
-        stream: claude_req.stream,
-        temperature: claude_req.temperature.map(|t| t as f32),
-        max_tokens: Some(claude_req.max_tokens as u32),
-        tools,
-        // 其他参数使用默认值
-        top_p: None,
-        n: None,
-        stop: None,
-        presence_penalty: None,
-        frequency_penalty: None,
-        logit_bias: None,
-        user: None,
-        tool_choice: None,
-        parallel_tool_calls: None,
-        response_format: None,
-        seed: None,
-        logprobs: None,
-        top_logprobs: None,
-        extra: serde_json::Map::new(),
-    }
-}
-
-/// 将 OpenAI 响应转换为 Claude 格式
-fn openai_to_claude_response(openai_resp: &serde_json::Value, requested_model: &str) -> serde_json::Value {
-    let id = openai_resp.get("id").and_then(|v| v.as_str()).unwrap_or("msg_unknown");
-    let model = openai_resp.get("model").and_then(|v| v.as_str()).unwrap_or(requested_model);
-
-    let content_text = openai_resp.get("choices")
-        .and_then(|c| c.as_array())
-        .and_then(|arr| arr.first())
-        .and_then(|c| c.get("message"))
-        .and_then(|m| m.get("content"))
-        .and_then(|c| c.as_str())
-        .unwrap_or("");
-
-    let finish_reason = openai_resp.get("choices")
-        .and_then(|c| c.as_array())
-        .and_then(|arr| arr.first())
-        .and_then(|c| c.get("finish_reason"))
-        .and_then(|v| v.as_str());
-
-    let stop_reason = match finish_reason {
-        Some("stop") => "end_turn",
-        Some("length") => "max_tokens",
-        Some("tool_calls") => "tool_use",
-        _ => "end_turn",
-    };
-
-    let usage = openai_resp.get("usage");
-    let input_tokens = usage.and_then(|u| u.get("prompt_tokens")).and_then(|v| v.as_u64()).unwrap_or(0);
-    let output_tokens = usage.and_then(|u| u.get("completion_tokens")).and_then(|v| v.as_u64()).unwrap_or(0);
-
-    json!({
-        "id": id,
-        "type": "message",
-        "role": "assistant",
-        "content": [{"type": "text", "text": content_text}],
-        "model": model,
-        "stop_reason": stop_reason,
-        "stop_sequence": null,
-        "usage": {
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens
-        }
-    })
 }
 
 /// 创建 Claude 格式错误响应

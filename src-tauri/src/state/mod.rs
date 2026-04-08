@@ -100,6 +100,8 @@ pub struct AppState {
     pub pricing_manager: Arc<RwLock<PricingManager>>,
     /// Group 策略状态
     pub group_strategy_state: Arc<GroupStrategyState>,
+    /// 共享 HTTP 客户端（复用连接池）
+    pub http_client: reqwest::Client,
 }
 
 /// 代理服务器句柄
@@ -139,6 +141,7 @@ impl AppState {
             oauth_state: OAuthState::new(),
             pricing_manager: Arc::new(RwLock::new(pricing_manager)),
             group_strategy_state: Arc::new(GroupStrategyState::new()),
+            http_client: reqwest::Client::new(),
         })
     }
 

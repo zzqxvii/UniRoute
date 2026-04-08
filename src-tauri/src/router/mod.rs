@@ -12,7 +12,6 @@ pub use rate_limiter::*;
 
 use crate::models::{ApiFormat, ChatRequest, EmbeddingRequest, ResponsesRequest, Group, GroupModel, GroupStrategy, ModelMapping, Provider, EndpointCapability};
 use crate::state::AppState;
-use crate::translator::Translator;
 use rand::Rng;
 use std::sync::Arc;
 
@@ -47,6 +46,32 @@ pub struct RouteResult {
     pub actual_request_body: Option<serde_json::Value>,
 }
 
+impl RouteResult {
+    /// 创建错误结果
+    fn error_result(
+        provider: &Provider,
+        actual_model: &str,
+        requested_model: String,
+        endpoint_type: Option<&str>,
+        error: String,
+    ) -> Self {
+        RouteResult {
+            response: None,
+            error: Some(error),
+            info: RouteInfo {
+                provider_name: Some(provider.name.clone()),
+                provider_prefix: Some(provider.prefix.clone()),
+                actual_model: Some(actual_model.to_string()),
+                requested_model,
+                actual_url: None,
+                protocol_transform: None,
+                endpoint_type: endpoint_type.map(|s| s.to_string()),
+            },
+            actual_request_body: None,
+        }
+    }
+}
+
 /// 智能拼接 API URL，处理 base_url 已包含 /v1 的情况
 fn build_api_url(base_url: &str, path: &str) -> String {
     let base = base_url.trim_end_matches('/');
@@ -61,7 +86,6 @@ fn build_api_url(base_url: &str, path: &str) -> String {
 /// 路由器
 pub struct Router {
     state: Arc<AppState>,
-    translator: Box<dyn Translator>,
     rate_limiter: RateLimiter,
     circuit_breaker: CircuitBreaker,
 }
@@ -70,10 +94,14 @@ impl Router {
     pub fn new(state: Arc<AppState>) -> Self {
         Self {
             state,
-            translator: crate::translator::get_translator(),
             rate_limiter: RateLimiter::new(),
             circuit_breaker: CircuitBreaker::new(),
         }
+    }
+
+    /// 获取共享 HTTP 客户端
+    fn http_client(&self) -> reqwest::Client {
+        self.state.http_client.clone()
     }
 
     /// 路由聊天请求
@@ -318,6 +346,95 @@ impl Router {
         self.route_responses_raw(&raw_body).await
     }
 
+    /// 路由 Claude Messages API 请求（直连模式：不做格式转换，直接转发原始请求）
+    pub async fn route_claude_messages_raw(&self, raw_body: &serde_json::Value) -> RouteResult {
+        // 从 JSON 中提取 model 字段
+        let requested_model = raw_body.get("model")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+        
+        tracing::info!("收到 Claude Messages 请求: model='{}'", requested_model);
+
+        // 1. 尝试通过 Group 查找 (endpoint_type = claude 或 messages)
+        let group = self.find_group(&requested_model, Some("claude"))
+            .or_else(|| self.find_group(&requested_model, Some("messages")));
+
+        if let Some(group) = group {
+            tracing::info!(
+                "Claude Messages 找到 Group: name='{}', endpoint_type={:?}",
+                group.name, group.endpoint_type
+            );
+            let ordered_models = self.select_model_by_strategy(&group);
+
+            for group_model in &ordered_models {
+                if let Some((provider, actual_model, _)) = self.resolve_model(&group_model.model) {
+                    let result = self.execute_claude_messages_with_provider_raw(
+                        &provider,
+                        &actual_model,
+                        raw_body,
+                        requested_model.clone(),
+                    ).await;
+
+                    if result.response.is_some() {
+                        return result;
+                    }
+
+                    tracing::warn!("Claude Messages 直连失败: {:?}", result.error);
+                    continue;
+                }
+            }
+        }
+
+        // 2. 尝试直接解析模型（格式: prefix/model 或 直接模型名）
+        if let Some((provider, actual_model, _)) = self.resolve_model(&requested_model) {
+            tracing::info!(
+                "Claude Messages 直连: model='{}' -> provider='{}', actual_model='{}'",
+                requested_model, provider.name, actual_model
+            );
+            return self.execute_claude_messages_with_provider_raw(
+                &provider,
+                &actual_model,
+                raw_body,
+                requested_model,
+            ).await;
+        }
+
+        // 3. 未找到 Provider
+        RouteResult {
+            response: None,
+            error: Some(format!("未找到模型 '{}' 对应的 Provider", requested_model)),
+            info: RouteInfo {
+                provider_name: None,
+                provider_prefix: None,
+                actual_model: None,
+                requested_model,
+                actual_url: None,
+                protocol_transform: None,
+                endpoint_type: Some("messages".to_string()),
+            },
+            actual_request_body: None,
+        }
+    }
+
+    /// 直接发送 Claude Messages 请求到 Provider（保留原始请求体）
+    async fn execute_claude_messages_with_provider_raw(
+        &self,
+        provider: &Provider,
+        actual_model: &str,
+        raw_body: &serde_json::Value,
+        requested_model: String,
+    ) -> RouteResult {
+        self.execute_raw_request(
+            provider,
+            actual_model,
+            raw_body,
+            requested_model,
+            "/v1/messages",
+            "messages",
+        ).await
+    }
+
     /// 直接发送 Responses 请求到 Provider（保留原始请求体）
     async fn execute_responses_with_provider_raw(
         &self,
@@ -326,67 +443,66 @@ impl Router {
         raw_body: &serde_json::Value,
         requested_model: String,
     ) -> RouteResult {
+        self.execute_raw_request(
+            provider,
+            actual_model,
+            raw_body,
+            requested_model,
+            "/v1/responses",
+            "responses",
+        ).await
+    }
+
+    /// 通用原始请求发送方法
+    async fn execute_raw_request(
+        &self,
+        provider: &Provider,
+        actual_model: &str,
+        raw_body: &serde_json::Value,
+        requested_model: String,
+        endpoint_path: &str,
+        endpoint_type: &str,
+    ) -> RouteResult {
         let circuit_key = format!("{}:{}", provider.prefix, actual_model);
 
         // 检查熔断器
         if !self.circuit_breaker.allow_request(&circuit_key).await {
-            return RouteResult {
-                response: None,
-                error: Some(format!("Provider '{}' 处于熔断状态", provider.name)),
-                info: RouteInfo {
-                    provider_name: Some(provider.name.clone()),
-                    provider_prefix: Some(provider.prefix.clone()),
-                    actual_model: Some(actual_model.to_string()),
-                    requested_model,
-                    actual_url: None,
-                    protocol_transform: None,
-                    endpoint_type: Some("responses".to_string()),
-                },
-                actual_request_body: None,
-            };
+            return RouteResult::error_result(
+                provider,
+                actual_model,
+                requested_model,
+                Some(endpoint_type),
+                format!("Provider '{}' 处于熔断状态", provider.name),
+            );
         }
 
         // 检查速率限制
         if let Err(e) = self.rate_limiter.check_rate_limit(&provider.id).await {
-            return RouteResult {
-                response: None,
-                error: Some(format!("Provider '{}' 触发速率限制: {:?}", provider.name, e)),
-                info: RouteInfo {
-                    provider_name: Some(provider.name.clone()),
-                    provider_prefix: Some(provider.prefix.clone()),
-                    actual_model: Some(actual_model.to_string()),
-                    requested_model,
-                    actual_url: None,
-                    protocol_transform: None,
-                    endpoint_type: Some("responses".to_string()),
-                },
-                actual_request_body: None,
-            };
+            return RouteResult::error_result(
+                provider,
+                actual_model,
+                requested_model,
+                Some(endpoint_type),
+                format!("Provider '{}' 触发速率限制: {:?}", provider.name, e),
+            );
         }
 
         // 获取认证凭证
         let auth_value = match provider.get_auth_value() {
             Some(v) => v,
             None => {
-                return RouteResult {
-                    response: None,
-                    error: Some(format!("Provider '{}' 未配置认证信息", provider.name)),
-                    info: RouteInfo {
-                        provider_name: Some(provider.name.clone()),
-                        provider_prefix: Some(provider.prefix.clone()),
-                        actual_model: Some(actual_model.to_string()),
-                        requested_model,
-                        actual_url: None,
-                        protocol_transform: None,
-                        endpoint_type: Some("responses".to_string()),
-                    },
-                    actual_request_body: None,
-                };
+                return RouteResult::error_result(
+                    provider,
+                    actual_model,
+                    requested_model,
+                    Some(endpoint_type),
+                    format!("Provider '{}' 未配置认证信息", provider.name),
+                );
             }
         };
 
-        // 构建 Responses API URL
-        let url = build_api_url(&provider.base_url, "/v1/responses");
+        // 构建 API URL
+        let url = build_api_url(&provider.base_url, endpoint_path);
 
         // 保留原始请求体，只替换 model 字段
         let mut body = raw_body.clone();
@@ -410,12 +526,11 @@ impl Router {
         }
 
         tracing::info!(
-            "直连发送 Responses 请求: url='{}', model='{}', provider='{}'",
-            url, actual_model, provider.name
+            "直连发送 {} 请求: url='{}', model='{}', provider='{}'",
+            endpoint_type, url, actual_model, provider.name
         );
 
-        let client = reqwest::Client::new();
-        let response = client
+        let response = self.http_client()
             .post(&url)
             .headers(headers)
             .json(&body)
@@ -425,7 +540,6 @@ impl Router {
         match response {
             Ok(resp) => {
                 self.circuit_breaker.record_success(&circuit_key).await;
-
                 RouteResult {
                     response: Some(resp),
                     error: None,
@@ -436,14 +550,13 @@ impl Router {
                         requested_model,
                         actual_url: Some(url),
                         protocol_transform: Some("direct".to_string()),
-                        endpoint_type: Some("responses".to_string()),
+                        endpoint_type: Some(endpoint_type.to_string()),
                     },
                     actual_request_body: Some(body),
                 }
             }
             Err(e) => {
                 self.circuit_breaker.record_failure(&circuit_key).await;
-
                 RouteResult {
                     response: None,
                     error: Some(format!("请求失败: {}", e)),
@@ -454,7 +567,7 @@ impl Router {
                         requested_model,
                         actual_url: Some(url),
                         protocol_transform: None,
-                        endpoint_type: Some("responses".to_string()),
+                        endpoint_type: Some(endpoint_type.to_string()),
                     },
                     actual_request_body: None,
                 }
@@ -607,8 +720,8 @@ impl Router {
         let mut last_result: Option<RouteResult> = None;
 
         for group_model in &ordered_models {
-            // 解析模型：前缀/模型名，返回目标格式
-            let (provider, actual_model, target_format) = match self.resolve_model(&group_model.model) {
+            // 解析模型：前缀/模型名
+            let (provider, actual_model, _target_format) = match self.resolve_model(&group_model.model) {
                 Some(result) => result,
                 None => {
                     tracing::warn!("无法解析模型: {}", group_model.model);
@@ -617,13 +730,13 @@ impl Router {
             };
 
             tracing::info!(
-                "Group 路由: strategy={:?}, group_model='{}' -> provider='{}', actual_model='{}', format={:?}",
-                group.strategy, group_model.model, provider.name, actual_model, target_format
+                "Group 路由: strategy={:?}, group_model='{}' -> provider='{}', actual_model='{}'",
+                group.strategy, group_model.model, provider.name, actual_model
             );
 
             request.model = actual_model.clone();
 
-            let result = self.execute_with_provider(&provider, &actual_model, request.clone(), requested_model.clone(), target_format).await;
+            let result = self.execute_with_provider(&provider, &actual_model, request.clone(), requested_model.clone()).await;
 
             if result.response.is_some() {
                 // 记录模型使用
@@ -666,7 +779,7 @@ impl Router {
 
     /// 执行单个模型请求
     async fn execute_single_model(&self, model: &str, request: ChatRequest, requested_model: String) -> RouteResult {
-        let (provider, actual_model, target_format) = match self.resolve_model(model) {
+        let (provider, actual_model, _target_format) = match self.resolve_model(model) {
             Some(result) => result,
             None => {
                 return RouteResult {
@@ -686,7 +799,7 @@ impl Router {
             }
         };
 
-        self.execute_with_provider(&provider, &actual_model, request, requested_model, target_format).await
+        self.execute_with_provider(&provider, &actual_model, request, requested_model).await
     }
 
     /// 使用 Group 执行 embedding 请求
@@ -762,20 +875,13 @@ impl Router {
         let auth_value = match provider.get_auth_value() {
             Some(v) => v,
             None => {
-                return RouteResult {
-                    response: None,
-                    error: Some(format!("Provider '{}' 未配置认证信息", provider.name)),
-                    info: RouteInfo {
-                        provider_name: Some(provider.name.clone()),
-                        provider_prefix: Some(provider.prefix.clone()),
-                        actual_model: Some(actual_model.to_string()),
-                        requested_model,
-                        actual_url: None,
-                        protocol_transform: None,
-                    endpoint_type: None,
-                    },
-                    actual_request_body: None,
-                };
+                return RouteResult::error_result(
+                    provider,
+                    actual_model,
+                    requested_model,
+                    None,
+                    format!("Provider '{}' 未配置认证信息", provider.name),
+                );
             }
         };
 
@@ -808,8 +914,8 @@ impl Router {
             }
         }
 
-        let client = reqwest::Client::new();
-        let response = match client.post(&url).headers(headers).json(&body).send().await {
+        // 使用共享 HTTP 客户端
+        let response = match self.http_client().post(&url).headers(headers).json(&body).send().await {
             Ok(r) => r,
             Err(e) => {
                 return RouteResult {
@@ -944,66 +1050,44 @@ impl Router {
         actual_model: &str,
         mut request: ChatRequest,
         requested_model: String,
-        target_format: ApiFormat,
     ) -> RouteResult {
         let circuit_key = format!("{}:{}", provider.prefix, actual_model);
 
         // 检查熔断器
         if !self.circuit_breaker.allow_request(&circuit_key).await {
             tracing::warn!("熔断器阻止请求: provider={}, model={}", provider.name, actual_model);
-            return RouteResult {
-                response: None,
-                error: Some(format!("Provider '{}' 处于熔断状态", provider.name)),
-                info: RouteInfo {
-                    provider_name: Some(provider.name.clone()),
-                    provider_prefix: Some(provider.prefix.clone()),
-                    actual_model: Some(actual_model.to_string()),
-                    requested_model,
-                    actual_url: None,
-                    protocol_transform: None,
-                    endpoint_type: None,
-                },
-                actual_request_body: None,
-            };
+            return RouteResult::error_result(
+                provider,
+                actual_model,
+                requested_model,
+                None,
+                format!("Provider '{}' 处于熔断状态", provider.name),
+            );
         }
 
         // 检查速率限制
         if let Err(e) = self.rate_limiter.check_rate_limit(&provider.id).await {
             tracing::warn!("速率限制阻止请求: provider={}, error={:?}", provider.name, e);
-            return RouteResult {
-                response: None,
-                error: Some(format!("Provider '{}' 触发速率限制: {:?}", provider.name, e)),
-                info: RouteInfo {
-                    provider_name: Some(provider.name.clone()),
-                    provider_prefix: Some(provider.prefix.clone()),
-                    actual_model: Some(actual_model.to_string()),
-                    requested_model,
-                    actual_url: None,
-                    protocol_transform: None,
-                    endpoint_type: None,
-                },
-                actual_request_body: None,
-            };
+            return RouteResult::error_result(
+                provider,
+                actual_model,
+                requested_model,
+                None,
+                format!("Provider '{}' 触发速率限制: {:?}", provider.name, e),
+            );
         }
 
         // 获取认证凭证
         let auth_value = match provider.get_auth_value() {
             Some(v) => v,
             None => {
-                return RouteResult {
-                    response: None,
-                    error: Some(format!("Provider '{}' 未配置认证信息", provider.name)),
-                    info: RouteInfo {
-                        provider_name: Some(provider.name.clone()),
-                        provider_prefix: Some(provider.prefix.clone()),
-                        actual_model: Some(actual_model.to_string()),
-                        requested_model,
-                        actual_url: None,
-                        protocol_transform: None,
-                    endpoint_type: None,
-                    },
-                    actual_request_body: None,
-                };
+                return RouteResult::error_result(
+                    provider,
+                    actual_model,
+                    requested_model,
+                    None,
+                    format!("Provider '{}' 未配置认证信息", provider.name),
+                );
             }
         };
 
@@ -1012,38 +1096,19 @@ impl Router {
             provider.name, provider.base_url, actual_model
         );
 
-        // 构建 URL（使用传入的 target_format）
-        let url = match self.build_url(&provider.base_url, &target_format, actual_model, request.stream) {
+        // 构建 URL（始终使用 OpenAI Chat Completions 格式）
+        let url = match self.build_url(&provider.base_url, &ApiFormat::OpenAI, actual_model, request.stream) {
             Ok(u) => u,
             Err(e) => {
                 self.circuit_breaker.record_failure(&circuit_key).await;
-                return RouteResult {
-                    response: None,
-                    error: Some(e.to_string()),
-                    info: RouteInfo {
-                        provider_name: Some(provider.name.clone()),
-                        provider_prefix: Some(provider.prefix.clone()),
-                        actual_model: Some(actual_model.to_string()),
-                        requested_model,
-                        actual_url: None,
-                        protocol_transform: None,
-                    endpoint_type: None,
-                    },
-                    actual_request_body: None,
-                };
+                return RouteResult::error_result(
+                    provider,
+                    actual_model,
+                    requested_model,
+                    None,
+                    e.to_string(),
+                );
             }
-        };
-
-        // 转换请求格式
-        let source_format = ApiFormat::OpenAI;
-        // target_format 已作为参数传入
-
-        // 生成协议转换标签（使用更直观的表述）
-        let transform_label = if source_format != target_format {
-            format!("{}→{}", source_format.name(), target_format.name())
-        } else {
-            // 相同格式，不需要显示转换
-            String::new()
         };
 
         let info = RouteInfo {
@@ -1052,36 +1117,22 @@ impl Router {
             actual_model: Some(actual_model.to_string()),
             requested_model,
             actual_url: Some(url.clone()),
-            protocol_transform: Some(transform_label.clone()),
+            protocol_transform: Some("direct".to_string()),
             endpoint_type: None,
         };
 
         request.model = actual_model.to_string();
 
-        let translated_body = if source_format != target_format {
-            match self.translator.translate_request(source_format, target_format, &request) {
-                Ok(b) => b,
-                Err(e) => {
-                    self.circuit_breaker.record_failure(&circuit_key).await;
-                    return RouteResult {
-                        response: None,
-                        error: Some(format!("请求格式转换失败: {}", e)),
-                        info,
-                        actual_request_body: None,
-                    };
-                }
-            }
-        } else {
-            match serde_json::to_value(&request) {
-                Ok(b) => b,
-                Err(e) => {
-                    return RouteResult {
-                        response: None,
-                        error: Some(format!("请求序列化失败: {}", e)),
-                        info,
-                        actual_request_body: None,
-                    };
-                }
+        // 直接序列化请求，不做格式转换
+        let mut body = match serde_json::to_value(&request) {
+            Ok(b) => b,
+            Err(e) => {
+                return RouteResult {
+                    response: None,
+                    error: Some(format!("请求序列化失败: {}", e)),
+                    info,
+                    actual_request_body: None,
+                };
             }
         };
 
@@ -1089,11 +1140,9 @@ impl Router {
         fn clean_json(value: &mut serde_json::Value) {
             match value {
                 serde_json::Value::Object(map) => {
-                    // 先递归处理所有子值
                     for v in map.values_mut() {
                         clean_json(v);
                     }
-                    // 然后删除 null 和空数组
                     let keys_to_remove: Vec<String> = map
                         .iter()
                         .filter(|(_, v)| {
@@ -1111,15 +1160,12 @@ impl Router {
                     for v in arr.iter_mut() {
                         clean_json(v);
                     }
-                    // 清理后如果数组中的元素是空对象，也处理
                     arr.retain(|v| !v.is_null());
                 }
                 _ => {}
             }
         }
-
-        let mut cleaned_body = translated_body;
-        clean_json(&mut cleaned_body);
+        clean_json(&mut body);
 
         // 构建请求头
         let headers = match self.build_headers_with_provider(&auth_value, provider) {
@@ -1135,16 +1181,14 @@ impl Router {
             }
         };
 
-        tracing::info!(">>> 协议转换: {}", transform_label);
-        tracing::info!(">>> 实际请求 URL: {}", url);
+        tracing::info!(">>> 直连请求 URL: {}", url);
         tracing::info!(
-            ">>> 实际请求 Body: {}",
-            serde_json::to_string(&cleaned_body).unwrap_or_else(|_| "serialize error".to_string())
+            ">>> 直连请求 Body: {}",
+            serde_json::to_string(&body).unwrap_or_else(|_| "serialize error".to_string())
         );
 
-        // 发送请求
-        let client = reqwest::Client::new();
-        let req = client.post(&url).headers(headers).json(&cleaned_body);
+        // 发送请求（使用共享 HTTP 客户端）
+        let req = self.http_client().post(&url).headers(headers).json(&body);
 
         let response = match req.send().await {
             Ok(r) => r,
@@ -1155,7 +1199,7 @@ impl Router {
                     response: None,
                     error: Some(format!("请求发送失败: {}", e)),
                     info,
-                    actual_request_body: Some(cleaned_body),
+                    actual_request_body: Some(body),
                 };
             }
         };
@@ -1174,7 +1218,7 @@ impl Router {
             response: Some(response),
             error: None,
             info,
-            actual_request_body: Some(cleaned_body),
+            actual_request_body: Some(body),
         }
     }
 
