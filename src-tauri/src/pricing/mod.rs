@@ -229,13 +229,39 @@ pub fn calculate_cost(
 }
 
 /// 规范化模型名称（去除供应商前缀）
-/// "ds/deepseek-chat" -> "deepseek-chat"
-/// "deepseek-chat" -> "deepseek-chat"
+/// 
+/// 例如：
+/// - "ds/deepseek-chat" + prefix="ds" -> "deepseek-chat"
+/// - "Pro/deepseek-ai/DeepSeek-V3.2" + prefix=None -> "Pro/deepseek-ai/DeepSeek-V3.2" (保持不变)
+/// 
+/// 注意：如果模型名本身包含 "/"（如 SiliconFlow 的模型），需要提供 provider_prefix
+/// 才能正确识别并去掉 provider prefix，否则会保留原样
 pub fn normalize_model_name(model: &str) -> &str {
+    // 查找第一个 "/"，如果存在则去掉前缀
+    // 这是一个简化版本，适用于大多数情况
     if let Some(pos) = model.find('/') {
         &model[pos + 1..]
     } else {
         model
+    }
+}
+
+/// 规范化模型名称（带 provider prefix 版本）
+/// 
+/// 这才是正确的用法：明确知道 provider prefix，只去掉真正的 prefix
+/// - "sf/Pro/deepseek-ai/DeepSeek-V3.2" + prefix="sf" -> "Pro/deepseek-ai/DeepSeek-V3.2"
+/// - "ds/deepseek-chat" + prefix="ds" -> "deepseek-chat"
+pub fn normalize_model_name_with_prefix<'a>(model: &'a str, provider_prefix: Option<&str>) -> &'a str {
+    match provider_prefix {
+        Some(prefix) if model.starts_with(prefix) && model.len() > prefix.len() && model.chars().nth(prefix.len()) == Some('/') => {
+            // 匹配到 provider prefix，去掉它
+            &model[prefix.len() + 1..]
+        }
+        _ => {
+            // 没有匹配到 prefix，保持原样不变
+            // 注意：不要尝试智能去掉任何部分，因为模型名本身可能包含 "/"
+            model
+        }
     }
 }
 

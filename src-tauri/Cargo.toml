@@ -44,6 +44,7 @@ base64 = "0.22"
 sha2 = "0.10"
 urlencoding = "2.1"
 regex = "1.12.3"
+toml_edit = "0.22"
 
 [profile.release]
 panic = "abort"

@@ -1,6 +1,8 @@
 //! UniRoute Tauri 命令
 
 use chrono::{DateTime, Utc};
+use serde::Serialize;
+use serde_json::Value as JsonValue;
 use crate::models::{Group, GroupModel, GroupStrategy, ModelMapping, Provider, ProviderTemplate, RequestLog};
 use crate::state::{AppSettings, AppState};
 use crate::proxy::start_proxy_server;
@@ -73,7 +75,7 @@ pub fn create_provider(
     prefix: String,
     base_url: String,
     api_key: Option<String>,
-    models: Option<Vec<String>>,
+    models: Option<Vec<crate::models::ModelConfig>>,
     auth_type: Option<String>,
     oauth: Option<crate::models::OAuthConfig>,
     headers: Option<std::collections::HashMap<String, String>>,
@@ -89,7 +91,7 @@ pub fn create_provider(
     let mut provider = Provider::new(name, prefix).with_base_url(base_url);
     provider.api_key = api_key;
     if let Some(models) = models {
-        provider.models = models.into_iter().map(|m| m.into()).collect();
+        provider.models = models;
     }
     if let Some(at) = auth_type {
         provider.auth_type = match at.as_str() {
@@ -106,7 +108,7 @@ pub fn create_provider(
     }
     provider.auth_prefix = auth_prefix;
 
-    state.add_provider(provider.clone());
+    state.add_provider(provider.clone()).map_err(|e| e.to_string())?;
     Ok(provider)
 }
 
@@ -123,8 +125,7 @@ pub fn update_provider(
         }
     }
 
-    state.update_provider(&id, provider);
-    Ok(())
+    state.update_provider(&id, provider).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -136,8 +137,7 @@ pub fn delete_provider(id: String, state: State<'_, Arc<AppState>>) -> Result<()
         return Err("内置供应商不能删除".to_string());
     }
 
-    state.delete_provider(&id);
-    Ok(())
+    state.delete_provider(&id).map_err(|e| e.to_string())
 }
 
 // ============ Provider Test Commands ============
@@ -426,10 +426,11 @@ pub fn create_group(
     name: String,
     description: Option<String>,
     strategy: Option<String>,
+    endpoint_type: Option<String>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<Group, String> {
-    if state.get_group_by_name(&name).is_some() {
-        return Err("Group 名称已存在".to_string());
+    if state.get_group_by_name(&name, endpoint_type.as_deref()).is_some() {
+        return Err("该端点下已存在同名 Group".to_string());
     }
 
     let mut group = Group::new(name);
@@ -446,21 +447,20 @@ pub fn create_group(
             _ => GroupStrategy::Priority,
         };
     }
+    group.endpoint_type = endpoint_type;
 
-    state.add_group(group.clone());
+    state.add_group(group.clone()).map_err(|e| e.to_string())?;
     Ok(group)
 }
 
 #[tauri::command]
 pub fn update_group(id: String, group: Group, state: State<'_, Arc<AppState>>) -> Result<(), String> {
-    state.update_group(&id, group);
-    Ok(())
+    state.update_group(&id, group).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub fn delete_group(id: String, state: State<'_, Arc<AppState>>) -> Result<(), String> {
-    state.delete_group(&id);
-    Ok(())
+    state.delete_group(&id).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -478,7 +478,7 @@ pub fn add_model_to_group(
         .with_weight(weight.unwrap_or(1));
 
     group.add_model(group_model);
-    state.update_group(&group_id, group.clone());
+    state.update_group(&group_id, group.clone()).map_err(|e| e.to_string())?;
     Ok(group)
 }
 
@@ -491,7 +491,7 @@ pub fn remove_model_from_group(
     let mut group = state.get_group(&group_id).ok_or_else(|| "Group 不存在".to_string())?;
     group.models.retain(|m| m.model != model);
     group.updated_at = chrono::Utc::now();
-    state.update_group(&group_id, group.clone());
+    state.update_group(&group_id, group.clone()).map_err(|e| e.to_string())?;
     Ok(group)
 }
 
@@ -508,19 +508,18 @@ pub fn create_model_mapping(
     group_id: String,
     priority: Option<u32>,
     state: State<'_, Arc<AppState>>,
-) -> ModelMapping {
+) -> Result<ModelMapping, String> {
     let mut mapping = ModelMapping::new(pattern, group_id);
     if let Some(p) = priority {
         mapping.priority = p;
     }
-    state.add_model_mapping(mapping.clone());
-    mapping
+    state.add_model_mapping(mapping.clone()).map_err(|e| e.to_string())?;
+    Ok(mapping)
 }
 
 #[tauri::command]
 pub fn delete_model_mapping(id: String, state: State<'_, Arc<AppState>>) -> Result<(), String> {
-    state.delete_model_mapping(&id);
-    Ok(())
+    state.delete_model_mapping(&id).map_err(|e| e.to_string())
 }
 
 // ============ Settings Commands ============
@@ -649,6 +648,22 @@ pub fn get_daily_cost(
     state: State<'_, Arc<AppState>>,
 ) -> Vec<crate::storage::DailyCost> {
     state.db.get_daily_cost(days.unwrap_or(30)).unwrap_or_default()
+}
+
+#[tauri::command]
+pub fn get_hourly_traffic(
+    hours: Option<i64>,
+    state: State<'_, Arc<AppState>>,
+) -> Vec<crate::storage::HourlyTraffic> {
+    state.db.get_hourly_traffic(hours.unwrap_or(24)).unwrap_or_default()
+}
+
+#[tauri::command]
+pub fn get_provider_health(
+    hours: Option<i64>,
+    state: State<'_, Arc<AppState>>,
+) -> Vec<crate::storage::ProviderHealth> {
+    state.db.get_provider_health(hours.unwrap_or(24)).unwrap_or_default()
 }
 
 #[tauri::command]
@@ -796,7 +811,7 @@ pub async fn poll_oauth_token(
     let mut provider = state.get_provider(&provider_id)
         .ok_or_else(|| "Provider 不存在".to_string())?;
     provider.oauth_tokens = Some(tokens.clone());
-    state.update_provider(&provider_id, provider);
+    let _ = state.update_provider(&provider_id, provider);
 
     Ok(tokens)
 }
@@ -826,7 +841,7 @@ pub async fn refresh_oauth_token(
     let mut provider = state.get_provider(&provider_id)
         .ok_or_else(|| "Provider 不存在".to_string())?;
     provider.oauth_tokens = Some(tokens.clone());
-    state.update_provider(&provider_id, provider);
+    let _ = state.update_provider(&provider_id, provider);
 
     Ok(tokens)
 }
@@ -994,8 +1009,8 @@ pub fn diagnose_route(
 ) -> RouteDiagnostic {
     let mut warnings = Vec::new();
 
-    // 检查 Group
-    let group = state.get_group_by_name(&model);
+    // 检查 Group（不限制端点类型）
+    let group = state.get_group_by_name(&model, None);
     let group_info = group.as_ref().map(|g| {
         GroupDiagnostic {
             name: g.name.clone(),
@@ -1196,4 +1211,466 @@ async fn ping_single_provider(
             error: Some(e.to_string()),
         },
     }
+}
+
+/// 端点测试结果
+#[derive(Debug, Clone, Serialize)]
+pub struct EndpointTestResult {
+    pub provider_id: String,
+    pub provider_name: String,
+    pub model: String,
+    pub endpoint: String,
+    pub success: bool,
+    pub latency_ms: u64,
+    pub status_code: Option<u16>,
+    pub error: Option<String>,
+    pub response_preview: Option<String>,
+}
+
+/// 测试模型的指定端点是否可用
+#[tauri::command]
+pub async fn test_model_endpoint(
+    provider_id: String,
+    model: String,
+    endpoint: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<EndpointTestResult, String> {
+    let provider = state.get_provider(&provider_id)
+        .ok_or_else(|| "Provider 不存在".to_string())?;
+
+    let auth_value = provider.get_auth_value()
+        .ok_or_else(|| "未配置认证信息".to_string())?;
+
+    // 解析端点类型
+    let endpoint_type = match endpoint.as_str() {
+        "chat" => crate::models::EndpointCapability::Chat,
+        "responses" => crate::models::EndpointCapability::Responses,
+        "claude" => crate::models::EndpointCapability::Claude,
+        "gemini" => crate::models::EndpointCapability::Gemini,
+        "embeddings" => crate::models::EndpointCapability::Embeddings,
+        "images" => crate::models::EndpointCapability::Images,
+        "audio" => crate::models::EndpointCapability::Audio,
+        "tts" => crate::models::EndpointCapability::TTS,
+        _ => return Err(format!("未知的端点类型: {}", endpoint)),
+    };
+
+    // 根据端点类型构建测试请求
+    let (url, body) = build_test_request(&provider, &model, endpoint_type);
+
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert("Content-Type", "application/json".parse().unwrap());
+    headers.insert(
+        reqwest::header::HeaderName::from_bytes(provider.auth_header.as_bytes()).unwrap(),
+        auth_value.parse().unwrap(),
+    );
+    for (key, value) in &provider.headers {
+        if let Ok(header_name) = reqwest::header::HeaderName::from_bytes(key.as_bytes()) {
+            headers.insert(header_name, value.parse().unwrap());
+        }
+    }
+
+    let start = std::time::Instant::now();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let result = client.post(&url).headers(headers).json(&body).send().await;
+    let latency = start.elapsed().as_millis() as u64;
+
+    match result {
+        Ok(response) => {
+            let status = response.status();
+            let status_code = status.as_u16();
+            let success = status.is_success();
+
+            // 读取响应内容（截取前 500 字符）
+            let response_text = response.text().await.unwrap_or_default();
+            let response_preview = if response_text.len() > 500 {
+                Some(format!("{}... (truncated)", &response_text[..500]))
+            } else if response_text.is_empty() {
+                None
+            } else {
+                Some(response_text)
+            };
+
+            Ok(EndpointTestResult {
+                provider_id: provider_id.clone(),
+                provider_name: provider.name.clone(),
+                model: model.clone(),
+                endpoint: endpoint.clone(),
+                success,
+                latency_ms: latency,
+                status_code: Some(status_code),
+                error: if success { None } else { Some(format!("HTTP {}", status_code)) },
+                response_preview,
+            })
+        }
+        Err(e) => Ok(EndpointTestResult {
+            provider_id: provider_id.clone(),
+            provider_name: provider.name.clone(),
+            model: model.clone(),
+            endpoint: endpoint.clone(),
+            success: false,
+            latency_ms: latency,
+            status_code: None,
+            error: Some(e.to_string()),
+            response_preview: None,
+        }),
+    }
+}
+
+/// 根据端点类型构建测试请求
+/// 智能拼接 API URL，处理 base_url 已包含 /v1 的情况
+fn build_api_url(base_url: &str, path: &str) -> String {
+    let base = base_url.trim_end_matches('/');
+    // 如果 path 以 /v1 开头且 base 已包含 /v1，则去掉重复
+    if base.ends_with("/v1") && path.starts_with("/v1/") {
+        format!("{}{}", base, &path[3..]) // 去掉 path 的 /v1
+    } else {
+        format!("{}{}", base, path)
+    }
+}
+
+fn build_test_request(
+    provider: &crate::models::Provider,
+    model: &str,
+    endpoint_type: crate::models::EndpointCapability,
+) -> (String, serde_json::Value) {
+    match endpoint_type {
+        crate::models::EndpointCapability::Chat => {
+            let url = build_api_url(&provider.base_url, "/v1/chat/completions");
+            let body = serde_json::json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "Hi"}],
+                "max_tokens": 5,
+            });
+            (url, body)
+        }
+        crate::models::EndpointCapability::Responses => {
+            let url = build_api_url(&provider.base_url, "/v1/responses");
+            let body = serde_json::json!({
+                "model": model,
+                "input": "Hi",
+                "max_output_tokens": 5,
+            });
+            (url, body)
+        }
+        crate::models::EndpointCapability::Claude => {
+            let url = build_api_url(&provider.base_url, "/v1/messages");
+            let body = serde_json::json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "Hi"}],
+                "max_tokens": 5,
+            });
+            (url, body)
+        }
+        crate::models::EndpointCapability::Gemini => {
+            // Gemini API 路径格式: /v1beta/models/{model}:generateContent
+            let url = build_api_url(&provider.base_url, &format!("/v1beta/models/{}:generateContent", model));
+            let body = serde_json::json!({
+                "contents": [{"parts": [{"text": "Hi"}]}],
+                "generationConfig": {"maxOutputTokens": 5},
+            });
+            (url, body)
+        }
+        crate::models::EndpointCapability::Embeddings => {
+            let url = build_api_url(&provider.base_url, "/v1/embeddings");
+            let body = serde_json::json!({
+                "model": model,
+                "input": "test",
+            });
+            (url, body)
+        }
+        crate::models::EndpointCapability::Images => {
+            let url = build_api_url(&provider.base_url, "/v1/images/generations");
+            let body = serde_json::json!({
+                "model": model,
+                "prompt": "a white cat",
+                "n": 1,
+                "size": "256x256",
+            });
+            (url, body)
+        }
+        crate::models::EndpointCapability::Videos => {
+            let url = build_api_url(&provider.base_url, "/v1/videos/generations");
+            let body = serde_json::json!({
+                "model": model,
+                "prompt": "a cat walking",
+            });
+            (url, body)
+        }
+        crate::models::EndpointCapability::Music => {
+            let url = build_api_url(&provider.base_url, "/v1/music/generations");
+            let body = serde_json::json!({
+                "model": model,
+                "prompt": "a happy tune",
+            });
+            (url, body)
+        }
+        crate::models::EndpointCapability::Audio => {
+            // Audio 需要文件，这里只测试端点是否存在
+            let url = build_api_url(&provider.base_url, "/v1/audio/transcriptions");
+            let body = serde_json::json!({
+                "model": model,
+            });
+            (url, body)
+        }
+        crate::models::EndpointCapability::TTS => {
+            let url = build_api_url(&provider.base_url, "/v1/audio/speech");
+            let body = serde_json::json!({
+                "model": model,
+                "input": "test",
+                "voice": "alloy",
+            });
+            (url, body)
+        }
+        crate::models::EndpointCapability::Moderation => {
+            let url = build_api_url(&provider.base_url, "/v1/moderations");
+            let body = serde_json::json!({
+                "model": model,
+                "input": "test",
+            });
+            (url, body)
+        }
+        crate::models::EndpointCapability::Rerank => {
+            let url = build_api_url(&provider.base_url, "/v1/rerank");
+            let body = serde_json::json!({
+                "model": model,
+                "query": "test",
+                "documents": ["doc1", "doc2"],
+            });
+            (url, body)
+        }
+    }
+}
+
+/// 从 Provider 获取可用模型列表
+#[derive(Debug, Clone, Serialize)]
+pub struct RemoteModel {
+    pub id: String,
+    pub name: String,
+    pub owned_by: Option<String>,
+}
+
+#[tauri::command]
+pub async fn fetch_provider_models(
+    provider_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<RemoteModel>, String> {
+    let provider = state.get_provider(&provider_id)
+        .ok_or_else(|| "Provider 不存在".to_string())?;
+
+    let auth_value = provider.get_auth_value()
+        .ok_or_else(|| "未配置认证信息".to_string())?;
+
+    let url = build_api_url(&provider.base_url, "/v1/models");
+
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert("Content-Type", "application/json".parse().unwrap());
+    headers.insert(
+        reqwest::header::HeaderName::from_bytes(provider.auth_header.as_bytes()).unwrap(),
+        auth_value.parse().unwrap(),
+    );
+    // OpenRouter 需要这些 header
+    headers.insert("HTTP-Referer", "https://uniroute.app".parse().unwrap());
+    headers.insert("X-Title", "UniRoute".parse().unwrap());
+    for (key, value) in &provider.headers {
+        if let Ok(header_name) = reqwest::header::HeaderName::from_bytes(key.as_bytes()) {
+            headers.insert(header_name, value.parse().unwrap());
+        }
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let response = client.get(&url).headers(headers).send().await
+        .map_err(|e| format!("请求失败: {}", e))?;
+
+    if !response.status().is_success() {
+        return Err(format!("获取模型列表失败: HTTP {}", response.status()));
+    }
+
+    let json: serde_json::Value = response.json().await
+        .map_err(|e| format!("解析响应失败: {}", e))?;
+
+    // 解析 OpenAI 格式的模型列表
+    let models = json.get("data")
+        .and_then(|d| d.as_array())
+        .map(|arr| {
+            arr.iter().filter_map(|m| {
+                let id = m.get("id")?.as_str()?.to_string();
+                let name = m.get("id").and_then(|v| v.as_str()).unwrap_or(&id).to_string();
+                let owned_by = m.get("owned_by").and_then(|v| v.as_str()).map(|s| s.to_string());
+                Some(RemoteModel { id, name, owned_by })
+            }).collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    Ok(models)
+}
+
+// ============ Client Configuration Commands ============
+
+/// 客户端配置状态
+#[derive(Debug, Clone, Serialize)]
+pub struct ClientConfigStatus {
+    pub client_type: String,
+    pub config_path: String,
+    pub exists: bool,
+    pub is_managed: bool,
+}
+
+/// 获取客户端配置状态
+#[tauri::command]
+pub fn get_client_config_status(client_type: String) -> ClientConfigStatus {
+    let status = crate::client_config::get_client_config_status(&client_type);
+    ClientConfigStatus {
+        client_type: status.client_type,
+        config_path: status.config_path,
+        exists: status.exists,
+        is_managed: status.is_managed,
+    }
+}
+
+/// 读取 Claude Code 配置
+#[tauri::command]
+pub fn read_claude_config(
+    base_url: String,
+    group_name: String,
+) -> Result<String, String> {
+    let settings = crate::client_config::read_claude_settings_with_default(&base_url, &group_name)
+        .map_err(|e| e.to_string())?;
+    
+    serde_json::to_string_pretty(&settings)
+        .map_err(|e| format!("序列化配置失败: {}", e))
+}
+
+/// 应用 Claude Code 配置
+#[tauri::command]
+pub fn apply_claude_config(
+    config: String,
+) -> Result<(), String> {
+    // 解析 JSON 验证格式
+    let _: JsonValue = serde_json::from_str(&config)
+        .map_err(|e| format!("无效的 JSON 格式: {}", e))?;
+    
+    // 写入配置文件
+    crate::client_config::ensure_claude_dir_exists()
+        .map_err(|e| e.to_string())?;
+    
+    let path = crate::client_config::get_claude_settings_path();
+    std::fs::write(&path, config).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 应用 Codex CLI 配置
+#[tauri::command]
+pub fn apply_codex_config(
+    auth: String,
+    config: String,
+) -> Result<(), String> {
+    // 验证 auth JSON
+    let _: JsonValue = serde_json::from_str(&auth)
+        .map_err(|e| format!("auth.json 格式错误: {}", e))?;
+    
+    // 验证 config TOML
+    config.parse::<toml_edit::DocumentMut>()
+        .map_err(|e| format!("config.toml 格式错误: {}", e))?;
+    
+    // 写入文件
+    crate::client_config::ensure_codex_dir_exists()
+        .map_err(|e| e.to_string())?;
+    
+    let auth_path = crate::client_config::get_codex_auth_path();
+    let config_path = crate::client_config::get_codex_config_path();
+    
+    std::fs::write(&auth_path, auth).map_err(|e| e.to_string())?;
+    std::fs::write(&config_path, config).map_err(|e| e.to_string())?;
+    
+    Ok(())
+}
+
+/// 读取 Codex CLI 配置
+#[tauri::command]
+pub fn read_codex_config(
+    base_url: String,
+    group_name: String,
+) -> Result<(String, String), String> {
+    let auth_path = crate::client_config::get_codex_auth_path();
+    let config_path = crate::client_config::get_codex_config_path();
+    
+    let auth = if auth_path.exists() {
+        std::fs::read_to_string(&auth_path).map_err(|e| e.to_string())?
+    } else {
+        serde_json::to_string_pretty(&serde_json::json!({
+            "OPENAI_API_KEY": "uniroute"
+        })).map_err(|e| e.to_string())?
+    };
+    
+    let config = if config_path.exists() {
+        std::fs::read_to_string(&config_path).map_err(|e| e.to_string())?
+    } else {
+        format!(r#"model_provider = "uniroute"
+model = "{}"
+
+[model_providers.uniroute]
+name = "UniRoute"
+base_url = "{}"
+wire_api = "responses"
+requires_openai_auth = true"#, group_name, base_url)
+    };
+    
+    Ok((auth, config))
+}
+
+/// 清除 Claude Code 配置
+#[tauri::command]
+pub fn clear_claude_config() -> Result<bool, String> {
+    crate::client_config::clear_claude_config()
+        .map_err(|e| format!("清除 Claude 配置失败: {}", e))
+}
+
+/// 清除 Codex CLI 配置
+#[tauri::command]
+pub fn clear_codex_config() -> Result<bool, String> {
+    crate::client_config::clear_codex_config()
+        .map_err(|e| format!("清除 Codex 配置失败: {}", e))
+}
+
+/// 打开客户端配置目录
+#[tauri::command]
+pub fn open_client_config_dir(client_type: String) -> Result<(), String> {
+    let dir = match client_type.as_str() {
+        "claude" => crate::client_config::get_claude_config_dir(),
+        "codex" => crate::client_config::get_codex_config_dir(),
+        _ => return Err(format!("未知的客户端类型: {}", client_type)),
+    };
+    
+    // 确保目录存在
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("创建目录失败: {}", e))?;
+    
+    // 使用系统默认程序打开目录
+    #[cfg(target_os = "windows")]
+    std::process::Command::new("explorer")
+        .arg(&dir)
+        .spawn()
+        .map_err(|e| format!("打开目录失败: {}", e))?;
+    
+    #[cfg(target_os = "macos")]
+    std::process::Command::new("open")
+        .arg(&dir)
+        .spawn()
+        .map_err(|e| format!("打开目录失败: {}", e))?;
+    
+    #[cfg(target_os = "linux")]
+    std::process::Command::new("xdg-open")
+        .arg(&dir)
+        .spawn()
+        .map_err(|e| format!("打开目录失败: {}", e))?;
+    
+    Ok(())
 }

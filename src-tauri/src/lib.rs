@@ -5,6 +5,7 @@
 //! - 智能路由和故障转移
 //! - 模型别名映射
 
+pub mod client_config;
 pub mod commands;
 pub mod models;
 pub mod oauth;

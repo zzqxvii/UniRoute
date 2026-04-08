@@ -7,13 +7,19 @@ use uniroute_lib::{commands::*, state::AppState};
 
 fn main() {
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+        )
         .init();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .setup(|app| {
-            let state = Arc::new(AppState::new());
+            let state = Arc::new(AppState::new().map_err(|e| {
+                tracing::error!("初始化应用状态失败: {}", e);
+                e
+            })?);
             app.manage(state.clone());
 
             // 检查是否需要自动启动代理
@@ -78,6 +84,8 @@ fn main() {
             get_cost_by_model,
             get_cost_by_provider,
             get_daily_cost,
+            get_hourly_traffic,
+            get_provider_health,
             get_pricing,
             set_pricing,
             delete_pricing,
@@ -96,6 +104,19 @@ fn main() {
             benchmark_provider,
             // Diagnostic
             diagnose_route,
+            // Endpoint Test
+            test_model_endpoint,
+            // Fetch Models
+            fetch_provider_models,
+            // Client Configuration
+            get_client_config_status,
+            apply_claude_config,
+            read_claude_config,
+            apply_codex_config,
+            read_codex_config,
+            clear_claude_config,
+            clear_codex_config,
+            open_client_config_dir,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

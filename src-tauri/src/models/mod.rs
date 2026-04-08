@@ -92,14 +92,186 @@ impl EndpointType {
 pub struct ModelPricing { pub input: f64, pub output: f64 }
 impl Default for ModelPricing { fn default() -> Self { Self { input: 0.0, output: 0.0 } } }
 
+// ============ 模型端点能力 ============
+
+/// 模型支持的端点类型
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum EndpointCapability {
+    /// Chat Completions API (OpenAI 格式)
+    Chat,
+    /// Responses API (OpenAI 新格式)
+    Responses,
+    /// Claude Messages API (Anthropic 格式)
+    Claude,
+    /// Gemini API (Google 格式)
+    Gemini,
+    /// Embeddings API
+    Embeddings,
+    /// Image Generation
+    Images,
+    /// Video Generation
+    Videos,
+    /// Music Generation
+    Music,
+    /// Audio Transcription/Translation (ASR)
+    Audio,
+    /// Text-to-Speech (TTS)
+    TTS,
+    /// Content Moderation
+    Moderation,
+    /// Rerank
+    Rerank,
+}
+
+impl EndpointCapability {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Chat => "Chat",
+            Self::Responses => "Responses",
+            Self::Claude => "Claude",
+            Self::Gemini => "Gemini",
+            Self::Embeddings => "Embeddings",
+            Self::Images => "Images",
+            Self::Videos => "Videos",
+            Self::Music => "Music",
+            Self::Audio => "Audio",
+            Self::TTS => "TTS",
+            Self::Moderation => "Moderation",
+            Self::Rerank => "Rerank",
+        }
+    }
+
+    pub fn icon(&self) -> &'static str {
+        match self {
+            Self::Chat => "💬",
+            Self::Responses => "⚡",
+            Self::Claude => "🤖",
+            Self::Gemini => "✨",
+            Self::Embeddings => "🔢",
+            Self::Images => "🖼️",
+            Self::Videos => "🎬",
+            Self::Music => "🎵",
+            Self::Audio => "🎤",
+            Self::TTS => "🔊",
+            Self::Moderation => "🛡️",
+            Self::Rerank => "📊",
+        }
+    }
+
+    pub fn endpoint_path(&self) -> &'static str {
+        match self {
+            Self::Chat => "/v1/chat/completions",
+            Self::Responses => "/v1/responses",
+            Self::Claude => "/v1/messages",
+            Self::Gemini => "/v1beta/models/{model}:generateContent",
+            Self::Embeddings => "/v1/embeddings",
+            Self::Images => "/v1/images/generations",
+            Self::Videos => "/v1/videos/generations",
+            Self::Music => "/v1/music/generations",
+            Self::Audio => "/v1/audio/transcriptions",
+            Self::TTS => "/v1/audio/speech",
+            Self::Moderation => "/v1/moderations",
+            Self::Rerank => "/v1/rerank",
+        }
+    }
+
+    pub fn all() -> Vec<Self> {
+        vec![
+            Self::Chat, Self::Responses, Self::Claude, Self::Gemini,
+            Self::Embeddings, Self::Images, Self::Videos, Self::Music,
+            Self::Audio, Self::TTS, Self::Moderation, Self::Rerank
+        ]
+    }
+
+    /// 常用端点（用于 UI 显示）
+    pub fn common() -> Vec<Self> {
+        vec![Self::Chat, Self::Responses, Self::Claude, Self::Gemini, Self::Embeddings, Self::Images]
+    }
+
+    /// 描述信息
+    pub fn description(&self) -> &'static str {
+        match self {
+            Self::Chat => "标准 Chat API，用于对话补全",
+            Self::Responses => "Responses API，用于 Codex、OpenCode 等工具",
+            Self::Claude => "Claude Messages API，用于 Claude 模型",
+            Self::Gemini => "Gemini API，用于 Google Gemini 模型",
+            Self::Embeddings => "向量嵌入，用于文本向量化",
+            Self::Images => "图像生成，用于创建图片",
+            Self::Videos => "视频生成，用于创建视频",
+            Self::Music => "音乐生成，用于创建音频",
+            Self::Audio => "语音转文字，用于音频转录",
+            Self::TTS => "文字转语音，用于语音合成",
+            Self::Moderation => "内容审核，用于检测不当内容",
+            Self::Rerank => "重排序，用于搜索结果重排",
+        }
+    }
+}
+
+impl Default for EndpointCapability {
+    fn default() -> Self {
+        Self::Chat
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelConfig {
     pub name: String,
     #[serde(default)]
     pub pricing: Option<ModelPricing>,
+    /// 支持的端点能力
+    #[serde(default)]
+    pub endpoints: Vec<EndpointCapability>,
+    /// RPM 限制 (requests per minute)
+    #[serde(default)]
+    pub rpm: Option<u32>,
+    /// TPM 限制 (tokens per minute)
+    #[serde(default)]
+    pub tpm: Option<u32>,
 }
-impl From<&str> for ModelConfig { fn from(name: &str) -> Self { Self { name: name.to_string(), pricing: None } } }
-impl From<String> for ModelConfig { fn from(name: String) -> Self { Self { name, pricing: None } } }
+
+impl ModelConfig {
+    /// 创建新模型配置，默认支持 Chat 端点
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            pricing: None,
+            endpoints: vec![EndpointCapability::Chat],
+            rpm: None,
+            tpm: None,
+        }
+    }
+
+    /// 检查是否支持指定端点
+    pub fn supports(&self, endpoint: EndpointCapability) -> bool {
+        self.endpoints.contains(&endpoint)
+    }
+
+    /// 添加端点支持
+    pub fn with_endpoint(mut self, endpoint: EndpointCapability) -> Self {
+        if !self.endpoints.contains(&endpoint) {
+            self.endpoints.push(endpoint);
+        }
+        self
+    }
+
+    /// 设置 RPM 限制
+    pub fn with_rpm(mut self, rpm: u32) -> Self {
+        self.rpm = Some(rpm);
+        self
+    }
+}
+
+impl From<&str> for ModelConfig {
+    fn from(name: &str) -> Self {
+        Self::new(name)
+    }
+}
+impl From<String> for ModelConfig {
+    fn from(name: String) -> Self {
+        Self::new(name)
+    }
+}
 
 // ============ 配额管理 ============
 
@@ -157,12 +329,15 @@ pub struct Provider {
     #[serde(default)] pub api_format: ApiFormat,
     #[serde(default)] pub models: Vec<ModelConfig>,
     #[serde(default = "default_enable_cost")] pub enable_cost: bool,
+    /// 定价货币单位: "USD" 或 "CNY"，默认 "CNY"
+    #[serde(default = "default_currency")] pub currency: String,
     pub is_active: bool, pub is_builtin: bool,
     pub created_at: DateTime<Utc>, pub updated_at: DateTime<Utc>,
 }
 
 fn default_auth_header() -> String { "Authorization".to_string() }
 fn default_enable_cost() -> bool { true }
+fn default_currency() -> String { "CNY".to_string() }
 
 impl Provider {
     pub fn new(name: String, prefix: String) -> Self {
@@ -172,7 +347,7 @@ impl Provider {
             api_key: None, auth_type: AuthType::ApiKey, oauth: None, oauth_tokens: None,
             headers: HashMap::new(), auth_header: "Authorization".to_string(), auth_prefix: None,
             base_url: String::new(), api_format: ApiFormat::default(),
-            models: Vec::new(), enable_cost: true,
+            models: Vec::new(), enable_cost: true, currency: "CNY".to_string(),
             is_active: true, is_builtin: false, created_at: now, updated_at: now,
         }
     }
@@ -243,9 +418,30 @@ impl ProviderEndpoint {
     }
 
     pub fn get_model_pricing(&self, model_name: &str) -> Option<&ModelPricing> {
-        self.models.iter()
+        // 首先尝试精确匹配
+        if let Some(pricing) = self.models.iter()
             .find(|m| m.name == model_name || m.name == "*")
-            .and_then(|m| m.pricing.as_ref())
+            .and_then(|m| m.pricing.as_ref()) {
+            return Some(pricing);
+        }
+        
+        // 尝试后缀匹配（处理路由解析后去掉前缀的情况）
+        // 例如：模型名 "DeepSeek-V3.2" 可以匹配 "Pro/deepseek-ai/DeepSeek-V3.2"
+        if let Some(pricing) = self.models.iter()
+            .find(|m| {
+                if m.name == "*" {
+                    return true;
+                }
+                // 检查 model_name 是否是 m.name 的后缀
+                m.name.ends_with(model_name) || 
+                // 或者去掉 m.name 前缀后匹配
+                m.name.split('/').last() == Some(model_name)
+            })
+            .and_then(|m| m.pricing.as_ref()) {
+            return Some(pricing);
+        }
+        
+        None
     }
 }
 
@@ -267,12 +463,14 @@ pub struct GroupModel {
     pub model: String,
     #[serde(default)] pub priority: i32,
     #[serde(default = "default_weight")] pub weight: u32,
+    #[serde(default = "default_enabled")] pub enabled: bool,
 }
 fn default_weight() -> u32 { 1 }
+fn default_enabled() -> bool { true }
 
 impl GroupModel {
     pub fn new(model: String) -> Self {
-        Self { model, priority: 0, weight: 1 }
+        Self { model, priority: 0, weight: 1, enabled: true }
     }
     pub fn with_priority(mut self, priority: u32) -> Self {
         self.priority = priority as i32;
@@ -280,6 +478,10 @@ impl GroupModel {
     }
     pub fn with_weight(mut self, weight: u32) -> Self {
         self.weight = weight;
+        self
+    }
+    pub fn with_enabled(mut self, enabled: bool) -> Self {
+        self.enabled = enabled;
         self
     }
 }
@@ -291,6 +493,13 @@ pub struct Group {
     pub models: Vec<GroupModel>,
     #[serde(default)] pub strategy: GroupStrategy,
     #[serde(default)] pub config: GroupConfig,
+    /// 端点类型：用于指定此 Group 服务于哪种 API 格式
+    /// - chat: 标准 Chat API（默认）
+    /// - responses: OpenAI Responses API（Codex、OpenCode 等）
+    /// - claude: Claude Messages API
+    /// - gemini: Gemini API
+    #[serde(default)]
+    pub endpoint_type: Option<String>,
     pub is_active: bool,
     pub created_at: DateTime<Utc>, pub updated_at: DateTime<Utc>,
 }
@@ -305,6 +514,7 @@ impl Group {
             models: Vec::new(),
             strategy: GroupStrategy::default(),
             config: GroupConfig::default(),
+            endpoint_type: None,
             is_active: true,
             created_at: now,
             updated_at: now,
@@ -365,11 +575,16 @@ pub struct RequestLog {
     pub provider_prefix: Option<String>,
     pub url: Option<String>,
     pub protocol_transform: Option<String>,
+    pub endpoint_type: Option<String>,
     pub status_code: i32,
     pub latency_ms: i64,
     pub first_token_ms: Option<i64>,
     pub prompt_tokens: Option<i32>,
     pub completion_tokens: Option<i32>,
+    /// 原始请求的估算 token 数（转换前）
+    pub original_input_tokens: Option<i32>,
+    /// 转换后请求的估算 token 数（转换后）
+    pub translated_input_tokens: Option<i32>,
     pub cost: Option<f64>,
     pub error: Option<String>,
     /// 原始请求（客户端发送的请求）
@@ -394,11 +609,14 @@ impl RequestLog {
             provider_prefix: None,
             url: None,
             protocol_transform: None,
+            endpoint_type: None,
             status_code: 0,
             latency_ms: 0,
             first_token_ms: None,
             prompt_tokens: None,
             completion_tokens: None,
+            original_input_tokens: None,
+            translated_input_tokens: None,
             cost: None,
             error: None,
             original_request_body: None,
@@ -427,6 +645,13 @@ impl RequestLog {
     pub fn with_tokens(mut self, prompt: i32, completion: i32) -> Self { self.prompt_tokens = Some(prompt); self.completion_tokens = Some(completion); self }
     pub fn with_cost(mut self, cost: f64) -> Self { self.cost = Some(cost); self }
     pub fn with_protocol_transform(mut self, transform: String) -> Self { self.protocol_transform = Some(transform); self }
+    pub fn with_endpoint_type(mut self, endpoint_type: String) -> Self { self.endpoint_type = Some(endpoint_type); self }
+    /// 设置原始请求和转换后请求的估算 token 数
+    pub fn with_input_tokens(mut self, original: i32, translated: i32) -> Self {
+        self.original_input_tokens = Some(original);
+        self.translated_input_tokens = Some(translated);
+        self
+    }
 }
 
 // ============ 设置 ============
@@ -500,15 +725,51 @@ impl ApiFormat {
 
 // ============ Chat Request ============
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Chat Completions API 请求
+/// 支持 OpenAI Chat Completions API 的完整参数
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ChatRequest {
     pub model: String,
     pub messages: Vec<Message>,
     #[serde(default)] pub stream: bool,
     #[serde(default)] pub temperature: Option<f32>,
+    #[serde(default)] pub top_p: Option<f32>,
+    #[serde(default)] pub n: Option<u32>,
+    #[serde(default)] pub stop: Option<Vec<String>>,
     #[serde(default)] pub max_tokens: Option<u32>,
+    #[serde(default)] pub presence_penalty: Option<f32>,
+    #[serde(default)] pub frequency_penalty: Option<f32>,
+    #[serde(default)] pub logit_bias: Option<std::collections::HashMap<String, f32>>,
+    #[serde(default)] pub user: Option<String>,
     #[serde(default)] pub tools: Vec<Tool>,
-    #[serde(flatten)] pub extra: serde_json::Map<String, serde_json::Value>,
+    #[serde(default)] pub tool_choice: Option<ToolChoice>,
+    #[serde(default)] pub parallel_tool_calls: Option<bool>,
+    #[serde(default)] pub response_format: Option<ResponseFormat>,
+    #[serde(default)] pub seed: Option<i64>,
+    #[serde(default)] pub logprobs: Option<bool>,
+    #[serde(default)] pub top_logprobs: Option<u32>,
+    /// 捕获其他未知字段
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+/// 工具选择策略
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ToolChoice {
+    /// 字符串: "none", "auto", "required"
+    String(String),
+    /// 对象: {"type": "function", "function": {"name": "..."}}
+    Object(serde_json::Value),
+}
+
+/// 响应格式
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResponseFormat {
+    #[serde(rename = "type")]
+    pub format_type: String,
+    #[serde(default)]
+    pub json_schema: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -554,20 +815,66 @@ pub struct ImageUrl {
 
 // ============ Responses API ============
 
+/// OpenAI Responses API 请求
+/// https://platform.openai.com/docs/api-reference/responses
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResponsesRequest {
     pub model: String,
-    /// Responses API 的 input 字段（可选，某些客户端如 Codex 可能发送 messages 字段）
-    #[serde(default)]
+    /// 输入内容：文本或消息项数组
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input: Option<ResponsesInput>,
-    #[serde(default)] pub stream: bool,
-    #[serde(default)] pub instructions: Option<String>,
-    #[serde(default)] pub tools: Vec<Tool>,
-    #[serde(default)] pub temperature: Option<f64>,
-    #[serde(default)] pub max_output_tokens: Option<i32>,
-    /// 捕获额外字段（如 messages，用于兼容 Chat API 格式的请求）
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stream: bool,
+    /// 系统指令（转换为 system message）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<Tool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<ToolChoice>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<ResponseFormat>,
+    /// 思考配置（无法映射到 Chat API）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<ReasoningConfig>,
+    /// 截断策略（无法映射到 Chat API）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncation: Option<String>,
+    /// 会话 ID（无法映射到 Chat API）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_response_id: Option<String>,
+    /// 用户标识
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    /// 元数据（无法映射到 Chat API）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
+    /// 服务层级（无法映射到 Chat API）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
+    /// 是否存储（无法映射到 Chat API）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store: Option<bool>,
+    /// 捕获其他未知字段
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+/// 思考配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReasoningConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generate_summary: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -660,7 +967,7 @@ pub struct ClaudeMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClaudeContent {
-    Text(String),
+    Text { text: String },
     Image { source: ClaudeImageSource },
     ToolUse { id: String, name: String, input: serde_json::Value },
     ToolResult { tool_use_id: String, content: String },

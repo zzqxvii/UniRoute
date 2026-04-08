@@ -10,7 +10,7 @@ pub use circuit_breaker::*;
 pub use fallback::*;
 pub use rate_limiter::*;
 
-use crate::models::{ApiFormat, ChatRequest, EmbeddingRequest, ResponsesRequest, Group, GroupModel, GroupStrategy, ModelMapping, Provider};
+use crate::models::{ApiFormat, ChatRequest, EmbeddingRequest, ResponsesRequest, Group, GroupModel, GroupStrategy, ModelMapping, Provider, EndpointCapability};
 use crate::state::AppState;
 use crate::translator::Translator;
 use rand::Rng;
@@ -47,6 +47,17 @@ pub struct RouteResult {
     pub actual_request_body: Option<serde_json::Value>,
 }
 
+/// 智能拼接 API URL，处理 base_url 已包含 /v1 的情况
+fn build_api_url(base_url: &str, path: &str) -> String {
+    let base = base_url.trim_end_matches('/');
+    // 如果 path 以 /v1 开头且 base 已包含 /v1，则去掉重复
+    if base.ends_with("/v1") && path.starts_with("/v1/") {
+        format!("{}{}", base, &path[3..]) // 去掉 path 的 /v1
+    } else {
+        format!("{}{}", base, path)
+    }
+}
+
 /// 路由器
 pub struct Router {
     state: Arc<AppState>,
@@ -70,8 +81,8 @@ impl Router {
         let requested_model = request.model.clone();
         tracing::info!("收到请求: model='{}'", requested_model);
 
-        // 1. 查找 Group
-        let group = self.find_group(&requested_model);
+        // 1. 查找 Group (chat 端点)
+        let group = self.find_group(&requested_model, Some("chat"));
 
         if let Some(group) = group {
             tracing::info!(
@@ -136,7 +147,7 @@ impl Router {
         let requested_model = request.model.clone();
         tracing::info!("收到 Embedding 请求: model='{}'", requested_model);
 
-        let group = self.find_group(&requested_model);
+        let group = self.find_group(&requested_model, Some("embeddings"));
 
         if let Some(group) = group {
             if group.models.is_empty() {
@@ -180,18 +191,281 @@ impl Router {
     }
 
     /// 路由 Responses API 请求
-    pub async fn route_responses(&self, request: ResponsesRequest) -> RouteResult {
-        let requested_model = request.model.clone();
+    /// 路由 Responses API 请求（使用原始 JSON）
+    pub async fn route_responses_raw(&self, raw_body: &serde_json::Value) -> RouteResult {
+        // 从 JSON 中提取 model 字段
+        let requested_model = raw_body.get("model")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+        
         tracing::info!("收到 Responses 请求: model='{}'", requested_model);
 
-        let chat_request = responses_to_chat_request(&request);
-        self.route_chat(chat_request).await
+        // 1. 先尝试直接解析模型（格式: prefix/model 或 prefix/org/model）
+        if let Some((provider, actual_model, _)) = self.resolve_model(&requested_model) {
+            // 检查该模型是否支持 responses 端点
+            let supports_responses = provider.models.iter()
+                .find(|m| m.name == actual_model)
+                .map(|m| m.supports(EndpointCapability::Responses))
+                .unwrap_or(false);
+
+            if supports_responses {
+                tracing::info!(
+                    "模型 '{}' 支持 Responses 端点，直连发送 (provider='{}')",
+                    actual_model, provider.name
+                );
+                return self.execute_responses_with_provider_raw(
+                    &provider,
+                    &actual_model,
+                    raw_body,
+                    requested_model,
+                ).await;
+            }
+        }
+
+        // 2. 遍历所有活跃 Provider，查找是否有模型名完全匹配（处理无前缀请求）
+        let providers = self.state.get_providers();
+        for provider in providers.iter().filter(|p| p.is_active) {
+            if let Some(model_config) = provider.models.iter().find(|m| m.name == requested_model) {
+                if model_config.supports(EndpointCapability::Responses) {
+                    tracing::info!(
+                        "在 Provider '{}' 中找到模型 '{}' 支持 Responses 端点，直连发送",
+                        provider.name, requested_model
+                    );
+                    return self.execute_responses_with_provider_raw(
+                        provider,
+                        &requested_model,
+                        raw_body,
+                        requested_model.clone(),
+                    ).await;
+                }
+            }
+        }
+
+        // 3. 尝试通过 Group 查找 (responses 端点)
+        let group = self.find_group(&requested_model, Some("responses"));
+
+        if let Some(group) = group {
+            // 检查 Group 中是否有模型支持 responses 端点
+            let ordered_models = self.select_model_by_strategy(&group);
+
+            for group_model in &ordered_models {
+                if let Some((provider, actual_model, _)) = self.resolve_model(&group_model.model) {
+                    // 检查该模型是否支持 responses 端点
+                    let supports_responses = provider.models.iter()
+                        .find(|m| m.name == actual_model)
+                        .map(|m| m.supports(EndpointCapability::Responses))
+                        .unwrap_or(false);
+
+                    if supports_responses {
+                        tracing::info!(
+                            "Group 模型 '{}' 支持 Responses 端点，直连发送",
+                            group_model.model
+                        );
+                        // 直接发送 Responses 请求
+                        let result = self.execute_responses_with_provider_raw(
+                            &provider,
+                            &actual_model,
+                            raw_body,
+                            requested_model.clone(),
+                        ).await;
+
+                        if result.response.is_some() {
+                            return result;
+                        }
+
+                        tracing::warn!("直连 Responses 失败: {:?}", result.error);
+                        continue;
+                    }
+                }
+            }
+
+            // 没有模型支持 responses 端点，转换为 Chat 格式
+            tracing::info!("Group '{}' 没有模型支持 Responses 端点，转换为 Chat 格式", group.name);
+        }
+
+        // 4. 降级：转换为 Chat 请求
+        tracing::info!("模型 '{}' 不支持 Responses 端点或未找到，转换为 Chat 格式", requested_model);
+        
+        // 解析为 ResponsesRequest 再转换
+        match serde_json::from_value::<ResponsesRequest>(raw_body.clone()) {
+            Ok(responses_request) => {
+                let chat_request = responses_to_chat_request(&responses_request);
+                self.route_chat(chat_request).await
+            }
+            Err(e) => {
+                RouteResult {
+                    response: None,
+                    error: Some(format!("无效的 Responses 请求格式: {}", e)),
+                    info: RouteInfo {
+                        provider_name: None,
+                        provider_prefix: None,
+                        actual_model: None,
+                        requested_model,
+                        actual_url: None,
+                        protocol_transform: None,
+                        endpoint_type: None,
+                    },
+                    actual_request_body: None,
+                }
+            }
+        }
+    }
+
+    /// 路由 Responses API 请求（兼容旧接口）
+    pub async fn route_responses(&self, request: ResponsesRequest) -> RouteResult {
+        let raw_body = serde_json::to_value(&request).unwrap_or_default();
+        self.route_responses_raw(&raw_body).await
+    }
+
+    /// 直接发送 Responses 请求到 Provider（保留原始请求体）
+    async fn execute_responses_with_provider_raw(
+        &self,
+        provider: &Provider,
+        actual_model: &str,
+        raw_body: &serde_json::Value,
+        requested_model: String,
+    ) -> RouteResult {
+        let circuit_key = format!("{}:{}", provider.prefix, actual_model);
+
+        // 检查熔断器
+        if !self.circuit_breaker.allow_request(&circuit_key).await {
+            return RouteResult {
+                response: None,
+                error: Some(format!("Provider '{}' 处于熔断状态", provider.name)),
+                info: RouteInfo {
+                    provider_name: Some(provider.name.clone()),
+                    provider_prefix: Some(provider.prefix.clone()),
+                    actual_model: Some(actual_model.to_string()),
+                    requested_model,
+                    actual_url: None,
+                    protocol_transform: None,
+                    endpoint_type: Some("responses".to_string()),
+                },
+                actual_request_body: None,
+            };
+        }
+
+        // 检查速率限制
+        if let Err(e) = self.rate_limiter.check_rate_limit(&provider.id).await {
+            return RouteResult {
+                response: None,
+                error: Some(format!("Provider '{}' 触发速率限制: {:?}", provider.name, e)),
+                info: RouteInfo {
+                    provider_name: Some(provider.name.clone()),
+                    provider_prefix: Some(provider.prefix.clone()),
+                    actual_model: Some(actual_model.to_string()),
+                    requested_model,
+                    actual_url: None,
+                    protocol_transform: None,
+                    endpoint_type: Some("responses".to_string()),
+                },
+                actual_request_body: None,
+            };
+        }
+
+        // 获取认证凭证
+        let auth_value = match provider.get_auth_value() {
+            Some(v) => v,
+            None => {
+                return RouteResult {
+                    response: None,
+                    error: Some(format!("Provider '{}' 未配置认证信息", provider.name)),
+                    info: RouteInfo {
+                        provider_name: Some(provider.name.clone()),
+                        provider_prefix: Some(provider.prefix.clone()),
+                        actual_model: Some(actual_model.to_string()),
+                        requested_model,
+                        actual_url: None,
+                        protocol_transform: None,
+                        endpoint_type: Some("responses".to_string()),
+                    },
+                    actual_request_body: None,
+                };
+            }
+        };
+
+        // 构建 Responses API URL
+        let url = build_api_url(&provider.base_url, "/v1/responses");
+
+        // 保留原始请求体，只替换 model 字段
+        let mut body = raw_body.clone();
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert("model".to_string(), serde_json::json!(actual_model));
+        }
+
+        // 构建请求头
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("Content-Type", "application/json".parse().unwrap());
+        if let Ok(h) = reqwest::header::HeaderName::from_bytes(provider.auth_header.as_bytes()) {
+            headers.insert(h, auth_value.parse().unwrap());
+        }
+        for (key, value) in &provider.headers {
+            if let (Ok(k), Ok(v)) = (
+                reqwest::header::HeaderName::from_bytes(key.as_bytes()),
+                reqwest::header::HeaderValue::from_str(value),
+            ) {
+                headers.insert(k, v);
+            }
+        }
+
+        tracing::info!(
+            "直连发送 Responses 请求: url='{}', model='{}', provider='{}'",
+            url, actual_model, provider.name
+        );
+
+        let client = reqwest::Client::new();
+        let response = client
+            .post(&url)
+            .headers(headers)
+            .json(&body)
+            .send()
+            .await;
+
+        match response {
+            Ok(resp) => {
+                self.circuit_breaker.record_success(&circuit_key).await;
+
+                RouteResult {
+                    response: Some(resp),
+                    error: None,
+                    info: RouteInfo {
+                        provider_name: Some(provider.name.clone()),
+                        provider_prefix: Some(provider.prefix.clone()),
+                        actual_model: Some(actual_model.to_string()),
+                        requested_model,
+                        actual_url: Some(url),
+                        protocol_transform: Some("direct".to_string()),
+                        endpoint_type: Some("responses".to_string()),
+                    },
+                    actual_request_body: Some(body),
+                }
+            }
+            Err(e) => {
+                self.circuit_breaker.record_failure(&circuit_key).await;
+
+                RouteResult {
+                    response: None,
+                    error: Some(format!("请求失败: {}", e)),
+                    info: RouteInfo {
+                        provider_name: Some(provider.name.clone()),
+                        provider_prefix: Some(provider.prefix.clone()),
+                        actual_model: Some(actual_model.to_string()),
+                        requested_model,
+                        actual_url: Some(url),
+                        protocol_transform: None,
+                        endpoint_type: Some("responses".to_string()),
+                    },
+                    actual_request_body: None,
+                }
+            }
+        }
     }
 
     /// 查找 Group
-    fn find_group(&self, model_name: &str) -> Option<Group> {
-        // 1. 精确匹配
-        if let Some(group) = self.state.get_group_by_name(model_name) {
+    fn find_group(&self, model_name: &str, endpoint_type: Option<&str>) -> Option<Group> {
+        // 1. 精确匹配（根据端点类型）
+        if let Some(group) = self.state.get_group_by_name(model_name, endpoint_type) {
             return Some(group);
         }
 
@@ -212,7 +486,12 @@ impl Router {
 
     /// 根据策略选择模型
     fn select_model_by_strategy(&self, group: &Group) -> Vec<GroupModel> {
-        let models: Vec<_> = group.models.iter().cloned().collect();
+        // 过滤掉禁用的模型
+        let models: Vec<_> = group.models.iter().filter(|m| m.enabled).cloned().collect();
+
+        if models.is_empty() {
+            return Vec::new();
+        }
 
         match group.strategy {
             GroupStrategy::Priority => {
@@ -500,7 +779,7 @@ impl Router {
             }
         };
 
-        let url = format!("{}/v1/embeddings", provider.base_url.trim_end_matches('/'));
+        let url = build_api_url(&provider.base_url, "/v1/embeddings");
 
         let info = RouteInfo {
             provider_name: Some(provider.name.clone()),
@@ -564,35 +843,48 @@ impl Router {
     /// 解析模型并返回端点类型
     /// 格式：
     /// - `prefix/model` -> 使用 Provider 默认 api_format
-    /// - `prefix/endpoint_type/model` -> 使用指定端点类型
+    /// - `prefix/endpoint_type/model` -> 使用指定端点类型（endpoint_type 必须是有效的端点名）
     fn resolve_model_with_endpoint(&self, model: &str) -> Option<(Provider, String, Option<ApiFormat>)> {
         let parts: Vec<&str> = model.splitn(3, '/').collect();
 
+        // 有效的端点类型名称
+        let valid_endpoints = ["chat", "responses", "messages", "gemini", "claude"];
+
         match parts.len() {
             3 => {
-                // 格式: prefix/endpoint_type/model
                 let prefix = parts[0];
-                let endpoint_type_str = parts[1];
-                let model_name = parts[2];
+                let possible_endpoint = parts[1].to_lowercase();
+                let remaining = parts[2];
 
-                // 解析端点类型
-                let api_format = match endpoint_type_str.to_lowercase().as_str() {
-                    "chat" => ApiFormat::OpenAI,
-                    "responses" => ApiFormat::OpenAI, // Responses 也用 OpenAI 格式，但端点不同
-                    "messages" => ApiFormat::Claude,
-                    "gemini" => ApiFormat::Gemini,
-                    _ => ApiFormat::OpenAI, // 默认
-                };
+                // 检查第二部分是否是有效的端点类型
+                if valid_endpoints.contains(&possible_endpoint.as_str()) {
+                    // 格式: prefix/endpoint_type/model
+                    let api_format = match possible_endpoint.as_str() {
+                        "chat" => ApiFormat::OpenAI,
+                        "responses" => ApiFormat::OpenAI,
+                        "messages" => ApiFormat::Claude,
+                        "gemini" => ApiFormat::Gemini,
+                        "claude" => ApiFormat::Claude,
+                        _ => ApiFormat::OpenAI,
+                    };
 
-                // 查找 Provider
-                if let Some(provider) = self.state.get_provider_by_prefix(prefix) {
-                    tracing::debug!("解析模型: '{}' -> provider='{}', model='{}', format={:?}", model, provider.name, model_name, api_format);
-                    return Some((provider, model_name.to_string(), Some(api_format)));
-                }
-
-                if let Some(provider) = self.state.get_provider(prefix) {
-                    tracing::debug!("解析模型: '{}' -> provider='{}', model='{}', format={:?}", model, provider.name, model_name, api_format);
-                    return Some((provider, model_name.to_string(), Some(api_format)));
+                    if let Some(provider) = self.state.get_provider_by_prefix(prefix) {
+                        tracing::debug!("解析模型(带端点): '{}' -> provider='{}', model='{}', format={:?}", model, provider.name, remaining, api_format);
+                        return Some((provider, remaining.to_string(), Some(api_format)));
+                    }
+                    if let Some(provider) = self.state.get_provider(prefix) {
+                        return Some((provider, remaining.to_string(), Some(api_format)));
+                    }
+                } else {
+                    // 格式: prefix/model（模型名本身包含 /）
+                    let model_name = format!("{}/{}", parts[1], remaining);
+                    if let Some(provider) = self.state.get_provider_by_prefix(prefix) {
+                        tracing::debug!("解析模型(模型名含/): '{}' -> provider='{}', model='{}'", model, provider.name, model_name);
+                        return Some((provider, model_name, None));
+                    }
+                    if let Some(provider) = self.state.get_provider(prefix) {
+                        return Some((provider, model_name, None));
+                    }
                 }
 
                 tracing::warn!("解析模型失败: '{}', 未找到 Provider 前缀 '{}'", model, prefix);
@@ -746,10 +1038,12 @@ impl Router {
         let source_format = ApiFormat::OpenAI;
         // target_format 已作为参数传入
 
+        // 生成协议转换标签（使用更直观的表述）
         let transform_label = if source_format != target_format {
-            format!("{}->{}", source_format.name(), target_format.name())
+            format!("{}→{}", source_format.name(), target_format.name())
         } else {
-            "direct".to_string()
+            // 相同格式，不需要显示转换
+            String::new()
         };
 
         let info = RouteInfo {
@@ -943,6 +1237,9 @@ impl Router {
                 // 如果 base_url 已经包含 /chat/completions，直接使用
                 if base.ends_with("/chat/completions") {
                     base.to_string()
+                } else if base.ends_with("/v1") {
+                    // base_url 已包含 /v1，不需要再加
+                    format!("{}/chat/completions", base)
                 } else if base.contains("/v2/coding") || base.contains("/v2") {
                     // 百度千帆格式：不需要 /v1 前缀
                     format!("{}/chat/completions", base)
@@ -955,14 +1252,22 @@ impl Router {
                 }
             }
             ApiFormat::Claude => {
-                format!("{}/v1/messages", base)
+                if base.ends_with("/v1") {
+                    format!("{}/messages", base)
+                } else {
+                    format!("{}/v1/messages", base)
+                }
             }
             ApiFormat::Gemini => {
                 let method = if stream { "streamGenerateContent" } else { "generateContent" };
                 format!("{}/v1beta/models/{}:{}", base, model, method)
             }
             ApiFormat::Responses => {
-                format!("{}/v1/responses", base)
+                if base.ends_with("/v1") {
+                    format!("{}/responses", base)
+                } else {
+                    format!("{}/v1/responses", base)
+                }
             }
         };
 
@@ -1342,6 +1647,7 @@ pub fn responses_to_chat_request(responses_req: &ResponsesRequest) -> ChatReques
                         }
                         Some(c) if c.is_array() => {
                             // 处理 Codex 格式的 content 数组: [{"text": "...", "type": "text"}]
+                            // 也处理 Responses API 格式: [{"type": "input_text", "text": "..."}]
                             let parts: Vec<crate::models::ContentPart> = c
                                 .as_array()
                                 .unwrap()
@@ -1350,7 +1656,8 @@ pub fn responses_to_chat_request(responses_req: &ResponsesRequest) -> ChatReques
                                     let part_type = part.get("type").and_then(|t| t.as_str()).unwrap_or("text");
                                     let text = part.get("text").and_then(|t| t.as_str());
                                     
-                                    if part_type == "text" {
+                                    // 支持 "text"、"input_text"、"output_text" 类型
+                                    if part_type == "text" || part_type == "input_text" || part_type == "output_text" {
                                         text.map(|t| crate::models::ContentPart {
                                             content_type: "text".to_string(),
                                             text: Some(t.to_string()),
@@ -1406,9 +1713,22 @@ pub fn responses_to_chat_request(responses_req: &ResponsesRequest) -> ChatReques
                 messages,
                 stream: responses_req.stream,
                 temperature: responses_req.temperature.map(|t| t as f32),
+                top_p: responses_req.top_p.map(|t| t as f32),
                 max_tokens: responses_req.max_output_tokens.map(|t| t as u32),
                 tools,
-                extra: serde_json::Map::new(),
+                tool_choice: responses_req.tool_choice.clone(),
+                parallel_tool_calls: responses_req.parallel_tool_calls,
+                response_format: responses_req.response_format.clone(),
+                user: responses_req.user.clone(),
+                n: None,
+                stop: None,
+                presence_penalty: None,
+                frequency_penalty: None,
+                logit_bias: None,
+                seed: None,
+                logprobs: None,
+                top_logprobs: None,
+                extra: responses_req.extra.clone(),
             };
         }
     }
@@ -1425,87 +1745,154 @@ pub fn responses_to_chat_request(responses_req: &ResponsesRequest) -> ChatReques
             }]
         }
         Some(crate::models::ResponsesInput::Items(items)) => {
-            items
-                .iter()
-                .filter_map(|item| {
-                    // 获取角色（如果没有角色，根据类型推断）
-                    let role = item.role.clone().unwrap_or_else(|| {
-                        if item.item_type == "message" {
-                            "user".to_string()
-                        } else {
-                            return String::new();
+            let mut messages: Vec<crate::models::Message> = Vec::new();
+            
+            for item in items {
+                match item.item_type.as_str() {
+                    "message" => {
+                        // 获取角色，处理特殊角色映射
+                        let role = item.role.clone().unwrap_or_else(|| "user".to_string());
+                        
+                        // 将 developer 角色映射为 system
+                        let normalized_role = match role.as_str() {
+                            "developer" => "system".to_string(),
+                            other => other.to_string(),
+                        };
+
+                        // 只处理有效的角色
+                        if normalized_role != "system" && normalized_role != "user" && normalized_role != "assistant" {
+                            tracing::debug!("跳过无效角色: {}", normalized_role);
+                            continue;
                         }
-                    });
 
-                    // 只处理有效的角色
-                    if role != "system" && role != "user" && role != "assistant" {
-                        return None;
-                    }
+                        // 转换内容
+                        let content = match &item.content {
+                            crate::models::ResponsesContent::Text(text) => {
+                                crate::models::MessageContent::Text(text.clone())
+                            }
+                            crate::models::ResponsesContent::Parts(parts) => {
+                                let converted: Vec<crate::models::ContentPart> = parts
+                                    .iter()
+                                    .filter_map(|p| {
+                                        // 转换 Responses API 类型到标准 OpenAI 类型
+                                        let normalized_type = match p.content_type.as_str() {
+                                            "input_text" | "output_text" => "text",
+                                            "input_image" => "image_url",
+                                            "refusal" => return None, // 跳过 refusal 类型
+                                            other => other,
+                                        };
 
-                    // 转换内容
-                    let content = match &item.content {
-                        crate::models::ResponsesContent::Text(text) => {
-                            crate::models::MessageContent::Text(text.clone())
-                        }
-                        crate::models::ResponsesContent::Parts(parts) => {
-                            let converted: Vec<crate::models::ContentPart> = parts
-                                .iter()
-                                .filter_map(|p| {
-                                    // 转换 Responses API 类型到标准 OpenAI 类型
-                                    let normalized_type = match p.content_type.as_str() {
-                                        "input_text" | "output_text" => "text",
-                                        "input_image" => "image_url",
-                                        "refusal" => return None, // 跳过 refusal 类型
-                                        other => other,
-                                    };
-
-                                    // 只保留有文本内容的 text 类型，或者有图片的 image_url 类型
-                                    if normalized_type == "text" {
-                                        if let Some(text_content) = &p.text {
-                                            Some(crate::models::ContentPart {
+                                        if normalized_type == "text" {
+                                            p.text.as_ref().map(|text_content| crate::models::ContentPart {
                                                 content_type: "text".to_string(),
                                                 text: Some(text_content.clone()),
                                                 image_url: None,
                                                 extra: serde_json::Map::new(),
                                             })
-                                        } else {
-                                            None
-                                        }
-                                    } else if normalized_type == "image_url" {
-                                        if let Some(img_url) = &p.image_url {
-                                            Some(crate::models::ContentPart {
+                                        } else if normalized_type == "image_url" {
+                                            p.image_url.as_ref().map(|img_url| crate::models::ContentPart {
                                                 content_type: "image_url".to_string(),
                                                 text: None,
                                                 image_url: Some(img_url.clone()),
                                                 extra: serde_json::Map::new(),
                                             })
                                         } else {
-                                            None
+                                            Some(crate::models::ContentPart {
+                                                content_type: normalized_type.to_string(),
+                                                text: p.text.clone(),
+                                                image_url: p.image_url.clone(),
+                                                extra: serde_json::Map::new(),
+                                            })
                                         }
-                                    } else {
-                                        // 其他类型，保留但清理 extra
-                                        Some(crate::models::ContentPart {
-                                            content_type: normalized_type.to_string(),
-                                            text: p.text.clone(),
-                                            image_url: p.image_url.clone(),
-                                            extra: serde_json::Map::new(),
-                                        })
-                                    }
-                                })
-                                .collect();
-                            crate::models::MessageContent::Parts(converted)
-                        }
-                    };
+                                    })
+                                    .collect();
+                                crate::models::MessageContent::Parts(converted)
+                            }
+                        };
 
-                    Some(crate::models::Message {
-                        role,
-                        content,
-                        name: None,
-                        tool_calls: Vec::new(),
-                        tool_call_id: None,
-                    })
-                })
-                .collect()
+                        messages.push(crate::models::Message {
+                            role: normalized_role,
+                            content,
+                            name: None,
+                            tool_calls: Vec::new(),
+                            tool_call_id: None,
+                        });
+                    }
+                    "function_call" => {
+                        // function_call 转换为 assistant message 的 tool_calls
+                        let call_id = item.extra.get("call_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let name = item.extra.get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let arguments = item.extra.get("arguments")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("{}")
+                            .to_string();
+
+                        // 检查最后一条消息是否是 assistant，如果是则追加 tool_call
+                        if let Some(last_msg) = messages.last_mut() {
+                            if last_msg.role == "assistant" {
+                                last_msg.tool_calls.push(crate::models::ToolCall {
+                                    id: call_id,
+                                    call_type: "function".to_string(),
+                                    function: crate::models::FunctionCall {
+                                        name,
+                                        arguments,
+                                    },
+                                });
+                                continue;
+                            }
+                        }
+
+                        // 否则创建新的 assistant message
+                        messages.push(crate::models::Message {
+                            role: "assistant".to_string(),
+                            content: crate::models::MessageContent::Text(String::new()),
+                            name: None,
+                            tool_calls: vec![crate::models::ToolCall {
+                                id: call_id,
+                                call_type: "function".to_string(),
+                                function: crate::models::FunctionCall {
+                                    name,
+                                    arguments,
+                                },
+                            }],
+                            tool_call_id: None,
+                        });
+                    }
+                    "function_call_output" => {
+                        // function_call_output 转换为 tool role message
+                        let call_id = item.extra.get("call_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let output = item.extra.get("output")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+
+                        messages.push(crate::models::Message {
+                            role: "tool".to_string(),
+                            content: crate::models::MessageContent::Text(output),
+                            name: None,
+                            tool_calls: Vec::new(),
+                            tool_call_id: Some(call_id),
+                        });
+                    }
+                    "reasoning" => {
+                        // reasoning 类型无法映射到 Chat API，记录日志后跳过
+                        tracing::debug!("跳过 reasoning 类型的 input 项");
+                    }
+                    other => {
+                        tracing::warn!("未知的 input 类型: {}", other);
+                    }
+                }
+            }
+            messages
         }
         Some(crate::models::ResponsesInput::Raw(value)) => {
             // 尝试从原始值中提取信息
@@ -1543,6 +1930,26 @@ pub fn responses_to_chat_request(responses_req: &ResponsesRequest) -> ChatReques
         }
     };
 
+    // 处理 instructions 字段：添加到 messages 开头作为 system 消息
+    let final_messages = if let Some(ref instructions) = responses_req.instructions {
+        if !instructions.is_empty() {
+            let mut msgs = Vec::with_capacity(messages.len() + 1);
+            msgs.push(crate::models::Message {
+                role: "system".to_string(),
+                content: crate::models::MessageContent::Text(instructions.clone()),
+                name: None,
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+            });
+            msgs.extend(messages);
+            msgs
+        } else {
+            messages
+        }
+    } else {
+        messages
+    };
+
     let tools: Vec<crate::models::Tool> = responses_req.tools.iter()
         .filter(|t| t.tool_type == "function" || t.function.is_some())
         .map(|t| t.normalize())
@@ -1550,12 +1957,28 @@ pub fn responses_to_chat_request(responses_req: &ResponsesRequest) -> ChatReques
 
     ChatRequest {
         model: responses_req.model.clone(),
-        messages,
+        messages: final_messages,
         stream: responses_req.stream,
+        // 直接映射的参数
         temperature: responses_req.temperature.map(|t| t as f32),
+        top_p: responses_req.top_p.map(|t| t as f32),
         max_tokens: responses_req.max_output_tokens.map(|t| t as u32),
         tools,
-        extra: serde_json::Map::new(),
+        tool_choice: responses_req.tool_choice.clone(),
+        parallel_tool_calls: responses_req.parallel_tool_calls,
+        response_format: responses_req.response_format.clone(),
+        user: responses_req.user.clone(),
+        // Chat API 独有参数（Responses API 不支持，保持默认）
+        n: None,
+        stop: None,
+        presence_penalty: None,
+        frequency_penalty: None,
+        logit_bias: None,
+        seed: None,
+        logprobs: None,
+        top_logprobs: None,
+        // 其他未知字段
+        extra: responses_req.extra.clone(),
     }
 }
 

@@ -12,6 +12,7 @@ interface RequestLog {
   provider_prefix: string | null;
   url: string | null;
   protocol_transform: string | null;
+  endpoint_type: string | null;
   status_code: number;
   latency_ms: number;
   first_token_ms: number | null;
@@ -42,20 +43,25 @@ const PROVIDER_COLORS: Record<string, { backgroundColor: string; color: string; 
   google: { backgroundColor: '#4285f4', color: '#fff', label: 'Google' },
   deepseek: { backgroundColor: '#6366f1', color: '#fff', label: 'DeepSeek' },
   moonshot: { backgroundColor: '#ec4899', color: '#fff', label: 'Moonshot' },
-  zhipu: { backgroundColor: '#8b5cf6', color: '#fff', label: '智谱' },
-  qwen: { backgroundColor: '#f97316', color: '#fff', label: '通义' },
-  baidu: { backgroundColor: '#3b82f6', color: '#fff', label: '百度' },
+  zhipu: { backgroundColor: '#8b5cf6', color: '#fff', label: 'Zhipu' },
+  qwen: { backgroundColor: '#f97316', color: '#fff', label: 'Qwen' },
+  baidu: { backgroundColor: '#3b82f6', color: '#fff', label: 'Baidu' },
   siliconflow: { backgroundColor: '#14b8a6', color: '#fff', label: 'SiliconFlow' },
   groq: { backgroundColor: '#f59e0b', color: '#fff', label: 'Groq' },
   mistral: { backgroundColor: '#f97316', color: '#fff', label: 'Mistral' },
   cohere: { backgroundColor: '#d97706', color: '#fff', label: 'Cohere' },
   openrouter: { backgroundColor: '#6366f1', color: '#fff', label: 'OpenRouter' },
   api2d: { backgroundColor: '#10b981', color: '#fff', label: 'API2D' },
+  yi: { backgroundColor: '#8b5cf6', color: '#fff', label: 'Yi' },
+  baichuan: { backgroundColor: '#f59e0b', color: '#fff', label: 'Baichuan' },
+  minimax: { backgroundColor: '#ec4899', color: '#fff', label: 'MiniMax' },
+  xunfei: { backgroundColor: '#3b82f6', color: '#fff', label: 'Xunfei' },
 };
 
 // 列定义
 const COLUMNS = [
   { key: 'status', label: '状态' },
+  { key: 'endpoint', label: '端点' },
   { key: 'requested', label: '请求名称' },
   { key: 'model', label: '实际模型' },
   { key: 'provider', label: '供应商' },
@@ -318,7 +324,7 @@ function Logs() {
             <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">总 Tokens</p>
           </div>
           <div className="card-base p-4 text-center">
-            <p className="text-2xl font-bold text-amber-600 dark:text-amber-400">${stats.total_cost.toFixed(4)}</p>
+            <p className="text-2xl font-bold text-amber-600 dark:text-amber-400">¥{stats.total_cost.toFixed(6)}</p>
             <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">总成本</p>
           </div>
           <div className="card-base p-4 text-center">
@@ -481,6 +487,11 @@ function Logs() {
                       状态
                     </th>
                   )}
+                  {visibleColumns.endpoint && (
+                    <th className="px-4 py-3 text-left text-[10px] font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider">
+                      端点
+                    </th>
+                  )}
                   {visibleColumns.requested && (
                     <th className="px-4 py-3 text-left text-[10px] font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider">
                       请求名称
@@ -561,6 +572,13 @@ function Logs() {
                           </span>
                         </td>
                       )}
+                      {visibleColumns.endpoint && (
+                        <td className="px-4 py-2.5">
+                          <span className="inline-block px-2 py-0.5 rounded text-[9px] font-bold bg-gray-100 dark:bg-gray-700 text-gray-600 dark:text-gray-400">
+                            {log.endpoint_type || 'chat'}
+                          </span>
+                        </td>
+                      )}
                       {visibleColumns.requested && (
                         <td className="px-4 py-2.5 text-xs font-mono">
                           <span className={
@@ -590,8 +608,8 @@ function Logs() {
                       {visibleColumns.transform && (
                         <td className="px-4 py-2.5">
                           {log.protocol_transform ? (
-                            <span className={`inline-block px-2 py-0.5 rounded text-[9px] font-bold ${
-                              log.protocol_transform === 'direct'
+                            <span className={`inline-block px-2 py-0.5 rounded text-[9px] font-bold whitespace-nowrap ${
+                              log.protocol_transform === 'direct' || !log.protocol_transform.includes('→')
                                 ? 'bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-400'
                                 : 'bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-400'
                             }`}>
@@ -620,7 +638,7 @@ function Logs() {
                       {visibleColumns.cost && (
                         <td className="px-4 py-2.5 text-right text-xs font-mono">
                           {log.cost != null && log.cost > 0 ? (
-                            <span className="text-amber-600 dark:text-amber-400">${log.cost.toFixed(6)}</span>
+                            <span className="text-amber-600 dark:text-amber-400">¥{log.cost.toFixed(6)}</span>
                           ) : (
                             <span className="text-gray-300 dark:text-gray-600">-</span>
                           )}
@@ -743,6 +761,14 @@ function Logs() {
                   </div>
                 </div>
                 <div>
+                  <div className="text-[10px] text-gray-400 uppercase tracking-wider mb-1">端点</div>
+                  <div className="text-sm">
+                    <span className="inline-block px-2 py-0.5 rounded text-[10px] font-bold bg-gray-100 dark:bg-gray-700 text-gray-600 dark:text-gray-400">
+                      {selectedLog.endpoint_type || 'chat'}
+                    </span>
+                  </div>
+                </div>
+                <div>
                   <div className="text-[10px] text-gray-400 uppercase tracking-wider mb-1">Provider</div>
                   <div className="text-sm">
                     <span
@@ -765,8 +791,8 @@ function Logs() {
                   <div className="text-[10px] text-gray-400 uppercase tracking-wider mb-1">协议转换</div>
                   <div className="text-sm">
                     {selectedLog.protocol_transform ? (
-                      <span className={`inline-block px-2 py-0.5 rounded text-xs font-bold ${
-                        selectedLog.protocol_transform === 'direct'
+                      <span className={`inline-block px-2 py-0.5 rounded text-xs font-bold whitespace-nowrap ${
+                        selectedLog.protocol_transform === 'direct' || !selectedLog.protocol_transform.includes('→')
                           ? 'bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-400'
                           : 'bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-400'
                       }`}>
@@ -791,7 +817,7 @@ function Logs() {
                 <div>
                   <div className="text-[10px] text-gray-400 uppercase tracking-wider mb-1">成本</div>
                   <div className="text-sm font-medium text-amber-600 dark:text-amber-400">
-                    {selectedLog.cost != null && selectedLog.cost > 0 ? `$${selectedLog.cost.toFixed(6)}` : '-'}
+                    {selectedLog.cost != null && selectedLog.cost > 0 ? `¥${selectedLog.cost.toFixed(6)}` : '-'}
                   </div>
                 </div>
               </div>
@@ -819,7 +845,7 @@ function Logs() {
               )}
 
               {/* 原始请求内容（仅在协议转换时显示） */}
-              {selectedLog.protocol_transform && selectedLog.protocol_transform !== 'direct' && selectedLog.original_request_body && (
+              {selectedLog.protocol_transform && selectedLog.protocol_transform.includes('→') && selectedLog.original_request_body && (
                 <div>
                   <div className="flex items-center justify-between mb-2">
                     <h3 className="text-[11px] text-blue-600 dark:text-blue-400 uppercase tracking-wider font-bold">
@@ -853,10 +879,10 @@ function Logs() {
               <div>
                 <div className="flex items-center justify-between mb-2">
                   <h3 className="text-[11px] text-gray-500 dark:text-gray-400 uppercase tracking-wider font-bold">
-                    {selectedLog.protocol_transform && selectedLog.protocol_transform !== 'direct' && selectedLog.original_request_body
+                    {selectedLog.protocol_transform && selectedLog.protocol_transform.includes('→') && selectedLog.original_request_body
                       ? '转换后请求'
                       : '请求内容'}
-                    {selectedLog.protocol_transform && selectedLog.protocol_transform !== 'direct' && selectedLog.original_request_body && (
+                    {selectedLog.protocol_transform && selectedLog.protocol_transform.includes('→') && selectedLog.original_request_body && (
                       <span className="ml-2 px-1.5 py-0.5 rounded text-[9px] bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-400">
                         已转换
                       </span>
@@ -889,10 +915,10 @@ function Logs() {
               <div>
                 <div className="flex items-center justify-between mb-2">
                   <h3 className="text-[11px] text-gray-500 dark:text-gray-400 uppercase tracking-wider font-bold">
-                    {selectedLog.protocol_transform && selectedLog.protocol_transform !== 'direct' && selectedLog.original_response_body
+                    {selectedLog.protocol_transform && selectedLog.protocol_transform.includes('→') && selectedLog.original_response_body
                       ? '转换后响应'
                       : '响应内容'}
-                    {selectedLog.protocol_transform && selectedLog.protocol_transform !== 'direct' && selectedLog.original_response_body && (
+                    {selectedLog.protocol_transform && selectedLog.protocol_transform.includes('→') && selectedLog.original_response_body && (
                       <span className="ml-2 px-1.5 py-0.5 rounded text-[9px] bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-400">
                         已转换
                       </span>
@@ -922,7 +948,7 @@ function Logs() {
               </div>
 
               {/* 原始响应内容（仅在协议转换时显示） */}
-              {selectedLog.protocol_transform && selectedLog.protocol_transform !== 'direct' && selectedLog.original_response_body && (
+              {selectedLog.protocol_transform && selectedLog.protocol_transform.includes('→') && selectedLog.original_response_body && (
                 <div>
                   <div className="flex items-center justify-between mb-2">
                     <h3 className="text-[11px] text-amber-600 dark:text-amber-400 uppercase tracking-wider font-bold">

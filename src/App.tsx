@@ -36,8 +36,8 @@ function App() {
 
   const navItems = [
     { path: '/', label: '仪表盘' },
-    { path: '/providers', label: 'Providers' },
-    { path: '/groups', label: 'Groups' },
+    { path: '/providers', label: '供应商' },
+    { path: '/groups', label: '组合' },
     { path: '/logs', label: '日志' },
     { path: '/settings', label: '设置' },
   ];

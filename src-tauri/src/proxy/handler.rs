@@ -10,11 +10,11 @@ use serde_json::json;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Mutex;
-use crate::models::{ChatRequest, ClaudeMessagesRequest, ClaudeContent, EmbeddingRequest, ResponsesRequest, Message, MessageContent};
-use crate::router::{Router, responses_to_chat_request, chat_to_responses_response};
+use crate::models::{ChatRequest, ClaudeMessagesRequest, ClaudeContent, EmbeddingRequest, Message, MessageContent};
+use crate::router::{Router, chat_to_responses_response};
 use crate::state::AppState;
 use crate::models::RequestLog;
-use crate::pricing::{calculate_cost, normalize_model_name};
+use crate::pricing::{calculate_cost, normalize_model_name_with_prefix};
 
 /// 判断响应是否是 SSE 流式响应
 fn is_sse_response(response: &reqwest::Response) -> bool {
@@ -230,7 +230,8 @@ pub async fn handle_chat_completions(
 ) -> Response {
     tracing::info!("收到聊天请求");
     let start_time = Instant::now();
-    let mut log_entry = RequestLog::new("POST".to_string(), "/v1/chat/completions".to_string());
+    let mut log_entry = RequestLog::new("POST".to_string(), "/v1/chat/completions".to_string())
+        .with_endpoint_type("chat".to_string());
 
     // 解析请求体
     let body = match axum::body::to_bytes(request.into_body(), 1024 * 1024).await {
@@ -283,8 +284,8 @@ pub async fn handle_chat_completions(
 
     // 打印路由结果
     tracing::info!(
-        "路由结果: provider={:?}, actual_model={:?}, error={:?}",
-        info.provider_name, info.actual_model, route_result.error
+        "路由结果: provider={:?}, prefix={:?}, actual_model={:?}, error={:?}",
+        info.provider_name, info.provider_prefix, info.actual_model, route_result.error
     );
 
     // 保存转换后的请求（发送给上游的）
@@ -344,6 +345,7 @@ pub async fn handle_chat_completions(
                 let model_for_cost = info.actual_model.clone();
                 let model_for_response = info.requested_model.clone();
                 let provider_for_cost_clone = provider_for_cost.clone();
+                let provider_prefix_for_cost = provider_for_cost.as_ref().map(|p| p.prefix.clone());
                 let pricing_manager = Arc::clone(&state.pricing_manager);
                 let collector = Arc::new(SseUsageCollector::new(start_time, move |events, latency_ms, first_token_ms, prompt_tokens, completion_tokens, full_content| {
                     let mut final_log = log_entry_base.clone();
@@ -357,40 +359,48 @@ pub async fn handle_chat_completions(
 
                     if prompt_tokens > 0 || completion_tokens > 0 {
                         final_log = final_log.with_tokens(prompt_tokens, completion_tokens);
+                        tracing::info!("流式响应提取到 tokens: prompt={}, completion={}", prompt_tokens, completion_tokens);
 
                         // 计算成本
                         if let Some(model) = &model_for_cost {
-                            let normalized_model = normalize_model_name(model);
+                            // 使用带 prefix 的标准化，正确处理模型名本身包含 / 的情况
+                            let prefix_ref = provider_prefix_for_cost.as_deref();
+                            let normalized_model = normalize_model_name_with_prefix(model, prefix_ref);
+                            tracing::info!("流式成本计算: model={}, prefix={:?}, normalized={}", model, prefix_ref, normalized_model);
 
-                            // 首先检查 Provider 是否启用了成本统计
-                            let should_calc_cost = provider_for_cost_clone.as_ref()
-                                .map(|p| p.enable_cost)
-                                .unwrap_or(true);
+                            if let Some(ref provider) = provider_for_cost_clone {
+                                tracing::info!("流式找到 Provider: name={}, enable_cost={}", provider.name, provider.enable_cost);
+                                
+                                if provider.enable_cost {
+                                    // 优先使用 Provider 的模型定价
+                                    let pricing_opt = provider.get_model_pricing(normalized_model)
+                                        .map(|p| crate::pricing::PricingEntry::new(p.input, p.output));
+                                    
+                                    tracing::info!("流式 Provider 定价查找: model={}, found={}", normalized_model, pricing_opt.is_some());
 
-                            if should_calc_cost {
-                                // 优先使用 Provider 的模型定价
-                                let pricing_opt = provider_for_cost_clone.as_ref()
-                                    .and_then(|p| p.get_model_pricing(normalized_model))
-                                    .map(|p| crate::pricing::PricingEntry::new(p.input, p.output));
+                                    // 如果没有，使用全局定价
+                                    let pricing = pricing_opt.or_else(|| {
+                                        let pm = pricing_manager.read();
+                                        let global_pricing = pm.get_pricing(&provider.prefix, normalized_model);
+                                        tracing::info!("流式全局定价查找: prefix={}, model={}, found={}", provider.prefix, normalized_model, global_pricing.is_some());
+                                        global_pricing
+                                    });
 
-                                // 如果没有，使用全局定价
-                                let pricing = pricing_opt.or_else(|| {
-                                    provider_for_cost_clone.as_ref()
-                                        .and_then(|p| pricing_manager.read().get_pricing(&p.prefix, normalized_model))
-                                });
-
-                                if let Some(pricing) = pricing {
-                                    let cost = calculate_cost(prompt_tokens, completion_tokens, None, None, &pricing);
-                                    final_log = final_log.with_cost(cost);
-                                    tracing::debug!(
-                                        "成本计算: model={}, prompt={}, completion={}, cost=${:.6}",
-                                        normalized_model,
-                                        prompt_tokens,
-                                        completion_tokens,
-                                        cost
-                                    );
+                                    if let Some(pricing) = pricing {
+                                        let cost = calculate_cost(prompt_tokens, completion_tokens, None, None, &pricing);
+                                        final_log = final_log.with_cost(cost);
+                                        tracing::info!("流式成本计算完成: cost=${:.6}", cost);
+                                    } else {
+                                        tracing::warn!("流式未找到模型定价: model={}", normalized_model);
+                                    }
+                                } else {
+                                    tracing::info!("流式 Provider 未启用成本统计");
                                 }
+                            } else {
+                                tracing::warn!("流式未找到 Provider");
                             }
+                        } else {
+                            tracing::warn!("流式未设置 actual_model");
                         }
                     }
 
@@ -545,36 +555,58 @@ pub async fn handle_chat_completions(
                     if let Some(prompt) = usage.get("prompt_tokens").and_then(|v| v.as_i64()) {
                         if let Some(completion) = usage.get("completion_tokens").and_then(|v| v.as_i64()) {
                             log_entry = log_entry.with_tokens(prompt as i32, completion as i32);
+                            tracing::info!("提取到 tokens: prompt={}, completion={}", prompt, completion);
 
                             // 计算成本
                             if let Some(model) = &info.actual_model {
-                                let normalized_model = normalize_model_name(model);
+                                // 使用带 prefix 的标准化，正确处理模型名本身包含 / 的情况
+                                let prefix_ref = info.provider_prefix.as_deref();
+                                let normalized_model = normalize_model_name_with_prefix(model, prefix_ref);
+                                tracing::info!("成本计算: model={}, prefix={:?}, normalized={}", model, prefix_ref, normalized_model);
 
-                                // 首先检查 Provider 是否启用了成本统计
-                                let should_calc_cost = provider_for_cost.as_ref()
-                                    .map(|p| p.enable_cost)
-                                    .unwrap_or(true);
+                                // 检查 provider_for_cost
+                                if let Some(ref provider) = provider_for_cost {
+                                    tracing::info!("找到 Provider: name={}, enable_cost={}", provider.name, provider.enable_cost);
+                                    
+                                    if provider.enable_cost {
+                                        // 优先使用 Provider 的模型定价
+                                        let pricing_opt = provider.get_model_pricing(normalized_model)
+                                            .map(|p| crate::pricing::PricingEntry::new(p.input, p.output));
+                                        
+                                        tracing::info!("Provider 定价查找: model={}, found={}", normalized_model, pricing_opt.is_some());
 
-                                if should_calc_cost {
-                                    // 优先使用 Provider 的模型定价
-                                    let pricing_opt = provider_for_cost.as_ref()
-                                        .and_then(|p| p.get_model_pricing(normalized_model))
-                                        .map(|p| crate::pricing::PricingEntry::new(p.input, p.output));
+                                        // 如果没有，使用全局定价
+                                        let pricing = pricing_opt.or_else(|| {
+                                            let pm = state.pricing_manager.read();
+                                            let global_pricing = pm.get_pricing(&provider.prefix, normalized_model);
+                                            tracing::info!("全局定价查找: prefix={}, model={}, found={}", provider.prefix, normalized_model, global_pricing.is_some());
+                                            global_pricing
+                                        });
 
-                                    // 如果没有，使用全局定价
-                                    let pricing = pricing_opt.or_else(|| {
-                                        provider_for_cost.as_ref()
-                                            .and_then(|p| state.pricing_manager.read().get_pricing(&p.prefix, normalized_model))
-                                    });
-
-                                    if let Some(pricing) = pricing {
-                                        let cost = calculate_cost(prompt as i32, completion as i32, None, None, &pricing);
-                                        log_entry = log_entry.with_cost(cost);
+                                        if let Some(pricing) = pricing {
+                                            let cost = calculate_cost(prompt as i32, completion as i32, None, None, &pricing);
+                                            log_entry = log_entry.with_cost(cost);
+                                            tracing::info!("成本计算完成: cost=${:.6}", cost);
+                                        } else {
+                                            tracing::warn!("未找到模型定价: model={}", normalized_model);
+                                        }
+                                    } else {
+                                        tracing::info!("Provider 未启用成本统计");
                                     }
+                                } else {
+                                    tracing::warn!("未找到 Provider: prefix={:?}", info.provider_prefix);
                                 }
+                            } else {
+                                tracing::warn!("未设置 actual_model");
                             }
+                        } else {
+                            tracing::warn!("响应中未找到 completion_tokens");
                         }
+                    } else {
+                        tracing::warn!("响应中未找到 prompt_tokens");
                     }
+                } else {
+                    tracing::warn!("响应中未找到 usage 字段");
                 }
 
                 state.save_request_log(&log_entry);
@@ -642,7 +674,8 @@ pub async fn handle_responses(
 ) -> Response {
     tracing::info!("收到 Responses API 请求");
     let start_time = Instant::now();
-    let mut log_entry = RequestLog::new("POST".to_string(), "/v1/responses".to_string());
+    let mut log_entry = RequestLog::new("POST".to_string(), "/v1/responses".to_string())
+        .with_endpoint_type("responses".to_string());
 
     let body = match axum::body::to_bytes(request.into_body(), 1024 * 1024).await {
         Ok(b) => b,
@@ -659,30 +692,27 @@ pub async fn handle_responses(
     // 保存原始请求（客户端发送的）
     log_entry = log_entry.with_original_request(request_body_str.clone());
 
-    let responses_request: ResponsesRequest = match serde_json::from_slice(&body) {
-        Ok(r) => r,
+    // 解析原始 JSON（保留所有字段）
+    let raw_body: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
         Err(e) => {
             log_entry = log_entry
                 .with_status(400)
-                .with_error(format!("Invalid request format: {}", e));
+                .with_error(format!("Invalid JSON format: {}", e));
             state.save_request_log(&log_entry);
-            return responses_error(400, format!("Invalid request format: {}", e));
+            return responses_error(400, format!("Invalid JSON format: {}", e));
         }
     };
 
-    let requested_model = responses_request.model.clone();
+    let requested_model = raw_body.get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
     log_entry = log_entry.with_requested_model(requested_model.clone());
 
-    // 将 Responses 格式转换为 Chat 格式后路由
-    let chat_request = responses_to_chat_request(&responses_request);
-    tracing::info!(
-        "Responses API 转换为 Chat 请求: model={}, messages_count={}",
-        chat_request.model,
-        chat_request.messages.len()
-    );
-
+    // 使用 Router 的 route_responses_raw 方法（保留原始请求体进行直连转发）
     let router = Router::new(Arc::clone(&state));
-    let route_result = router.route_chat(chat_request).await;
+    let route_result = router.route_responses_raw(&raw_body).await;
 
     let info = route_result.info.clone();
 
@@ -704,24 +734,192 @@ pub async fn handle_responses(
     if let Some(url) = &info.actual_url {
         log_entry = log_entry.with_url(url.clone());
     }
+    // 协议转换标签
     if let Some(transform) = &info.protocol_transform {
-        log_entry = log_entry.with_protocol_transform(format!("responses->{}", transform));
+        if !transform.is_empty() {
+            log_entry = log_entry.with_protocol_transform(transform.clone());
+        }
+    }
+    if let Some(endpoint_type) = &info.endpoint_type {
+        log_entry = log_entry.with_protocol_transform(format!("responses->{}", endpoint_type));
     }
 
     match (route_result.response, route_result.error) {
         (Some(response), None) => {
             let status = response.status();
+            let is_stream = is_sse_response(&response);
 
-            // 打印响应头用于调试
             tracing::info!(
-                "上游响应: status={}, content-type={:?}, transfer-encoding={:?}",
-                status,
-                response.headers().get("content-type").and_then(|v| v.to_str().ok()),
-                response.headers().get("transfer-encoding").and_then(|v| v.to_str().ok())
+                "上游响应: status={}, is_stream={}, endpoint_type={:?}",
+                status, is_stream, info.endpoint_type
             );
 
+            // 直连 Responses API：直接透传响应
+            if info.endpoint_type.as_deref() == Some("responses") {
+                tracing::info!("直连 Responses API，直接透传响应");
+
+                let mut builder = Response::builder().status(status.as_u16());
+
+                // 复制响应头
+                for (key, value) in response.headers() {
+                    let key_str = key.as_str();
+                    if !matches!(key_str, "content-encoding" | "content-length" | "transfer-encoding") {
+                        builder = builder.header(key, value);
+                    }
+                }
+
+                // 设置协议转换标签
+                log_entry = log_entry.with_protocol_transform("direct".to_string());
+
+                if is_stream {
+                    // 流式响应：透传字节流，同时解析 SSE 事件提取 tokens
+                    let state_clone = Arc::clone(&state);
+                    let log_entry_base = log_entry.clone();
+                    let start = start_time.clone();
+
+                    let byte_stream = response.bytes_stream();
+                    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::convert::Infallible>>(100);
+
+                    tokio::spawn(async move {
+                        use futures::StreamExt;
+
+                        let mut stream = byte_stream;
+                        let mut prompt_tokens = 0i32;
+                        let mut completion_tokens = 0i32;
+                        let mut buffer = String::new();
+
+                        while let Some(item) = stream.next().await {
+                            match item {
+                                Ok(bytes) => {
+                                    // 解析 SSE 事件提取 tokens
+                                    let chunk = String::from_utf8_lossy(&bytes);
+                                    buffer.push_str(&chunk);
+
+                                    // 解析 usage 信息
+                                    for line in buffer.lines() {
+                                        if line.starts_with("data: ") {
+                                            let data = &line[6..];
+                                            if data != "[DONE]" {
+                                                if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
+                                                    // 打印事件类型用于调试
+                                                    if let Some(event_type) = json.get("type").and_then(|v| v.as_str()) {
+                                                        tracing::debug!("SSE 事件类型: {}", event_type);
+                                                    }
+
+                                                    // Responses API 格式: response.completed 事件中的 response.usage
+                                                    if let Some(response_obj) = json.get("response") {
+                                                        if let Some(usage) = response_obj.get("usage") {
+                                                            tracing::info!("找到 response.usage: {:?}", usage);
+                                                            if let Some(input) = usage.get("input_tokens").and_then(|v| v.as_u64()) {
+                                                                prompt_tokens = input as i32;
+                                                            }
+                                                            if let Some(output) = usage.get("output_tokens").and_then(|v| v.as_u64()) {
+                                                                completion_tokens = output as i32;
+                                                            }
+                                                        }
+                                                    }
+                                                    // 直接在顶层的 usage（某些供应商可能使用）
+                                                    if let Some(usage) = json.get("usage") {
+                                                        tracing::info!("找到 usage: {:?}", usage);
+                                                        // Responses API 格式
+                                                        if let Some(input) = usage.get("input_tokens").and_then(|v| v.as_u64()) {
+                                                            prompt_tokens = input as i32;
+                                                        }
+                                                        if let Some(output) = usage.get("output_tokens").and_then(|v| v.as_u64()) {
+                                                            completion_tokens = output as i32;
+                                                        }
+                                                        // OpenAI Chat 格式
+                                                        if let Some(input) = usage.get("prompt_tokens").and_then(|v| v.as_u64()) {
+                                                            prompt_tokens = input as i32;
+                                                        }
+                                                        if let Some(output) = usage.get("completion_tokens").and_then(|v| v.as_u64()) {
+                                                            completion_tokens = output as i32;
+                                                        }
+                                                    }
+                                                    // delta 中的 usage
+                                                    if let Some(delta) = json.get("delta") {
+                                                        if let Some(usage) = delta.get("usage") {
+                                                            tracing::info!("找到 delta.usage: {:?}", usage);
+                                                            if let Some(input) = usage.get("input_tokens").and_then(|v| v.as_u64()) {
+                                                                prompt_tokens = input as i32;
+                                                            }
+                                                            if let Some(output) = usage.get("output_tokens").and_then(|v| v.as_u64()) {
+                                                                completion_tokens = output as i32;
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    // 清理已处理的 buffer（保留最后不完整的行）
+                                    if let Some(pos) = buffer.rfind('\n') {
+                                        buffer = buffer[pos + 1..].to_string();
+                                    }
+
+                                    if tx.send(Ok(bytes)).await.is_err() {
+                                        break;
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::error!("流式响应错误: {}", e);
+                                    break;
+                                }
+                            }
+                        }
+
+                        let latency = start.elapsed().as_millis() as i64;
+                        let mut final_log = log_entry_base.clone();
+                        final_log = final_log.with_status(200).with_latency(latency);
+                        if prompt_tokens > 0 || completion_tokens > 0 {
+                            final_log = final_log.with_tokens(prompt_tokens, completion_tokens);
+                        }
+                        state_clone.save_request_log(&final_log);
+                    });
+
+                    use tokio_stream::wrappers::ReceiverStream;
+                    return builder
+                        .header("content-type", "text/event-stream")
+                        .header("cache-control", "no-cache")
+                        .header("connection", "keep-alive")
+                        .body(Body::from_stream(ReceiverStream::new(rx)))
+                        .unwrap()
+                        .into_response();
+                } else {
+                    // 非流式响应：读取并解析 JSON 提取 tokens
+                    let body_bytes = response.bytes().await.unwrap_or_default();
+                    let latency = start_time.elapsed().as_millis() as i64;
+
+                    // 解析响应提取 tokens
+                    if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
+                        tracing::info!("直连 Responses 非流式响应: {}", serde_json::to_string(&json).unwrap_or_default().chars().take(500).collect::<String>());
+                        if let Some(usage) = json.get("usage") {
+                            // Responses API 格式
+                            let mut input_tokens = usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as i32;
+                            let mut output_tokens = usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as i32;
+                            // OpenAI 格式（OpenRouter 可能使用）
+                            if input_tokens == 0 {
+                                input_tokens = usage.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as i32;
+                            }
+                            if output_tokens == 0 {
+                                output_tokens = usage.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as i32;
+                            }
+                            tracing::info!("直连 Responses tokens: input={}, output={}", input_tokens, output_tokens);
+                            log_entry = log_entry.with_tokens(input_tokens, output_tokens);
+                        }
+                    }
+
+                    log_entry = log_entry.with_status(status.as_u16() as i32).with_latency(latency);
+                    state.save_request_log(&log_entry);
+
+                    return builder.body(Body::from(body_bytes)).unwrap().into_response();
+                }
+            }
+
+            // 非直连（转换为 Chat 格式）：需要处理响应转换
             // 检查是否是流式响应
-            if is_sse_response(&response) {
+            if is_stream {
                 tracing::info!("Responses API 流式响应被识别: provider='{}'", info.provider_name.as_deref().unwrap_or("-"));
 
                 let mut builder = Response::builder().status(status.as_u16());
@@ -1543,7 +1741,8 @@ pub async fn handle_claude_messages(
 ) -> Response {
     tracing::info!("收到 Claude Messages 请求");
     let start_time = Instant::now();
-    let mut log_entry = RequestLog::new("POST".to_string(), "/v1/messages".to_string());
+    let mut log_entry = RequestLog::new("POST".to_string(), "/v1/messages".to_string())
+        .with_endpoint_type("claude".to_string());
 
     let body = match axum::body::to_bytes(request.into_body(), 1024 * 1024).await {
         Ok(b) => b,
@@ -1559,22 +1758,26 @@ pub async fn handle_claude_messages(
     let request_body_str = String::from_utf8_lossy(&body).to_string();
     log_entry = log_entry.with_request(request_body_str.clone());
 
-    let claude_request: ClaudeMessagesRequest = match serde_json::from_slice(&body) {
-        Ok(r) => r,
+    // 直接解析为 JSON Value，避免严格结构体解析问题
+    let raw_body: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
         Err(e) => {
             log_entry = log_entry
                 .with_status(400)
-                .with_error(format!("Invalid request format: {}", e));
+                .with_error(format!("Invalid JSON format: {}", e));
             state.save_request_log(&log_entry);
-            return claude_error(400, format!("Invalid request format: {}", e));
+            return claude_error(400, format!("Invalid JSON format: {}", e));
         }
     };
 
-    let requested_model = claude_request.model.clone();
+    let requested_model = raw_body.get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
     log_entry = log_entry.with_requested_model(requested_model.clone());
 
     // 将 Claude 格式转换为 OpenAI 格式后路由
-    let chat_request = claude_to_chat_request(&claude_request);
+    let chat_request = claude_value_to_chat_request(&raw_body);
 
     let router = Router::new(Arc::clone(&state));
     let route_result = router.route_chat(chat_request).await;
@@ -1676,6 +1879,112 @@ pub async fn handle_claude_messages(
 }
 
 /// 将 Claude Messages 请求转换为 OpenAI Chat 请求
+/// 将 Claude 格式的 JSON Value 转换为 ChatRequest
+fn claude_value_to_chat_request(value: &serde_json::Value) -> ChatRequest {
+    let model = value.get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    
+    let mut messages = Vec::new();
+
+    // 处理 system (可能是字符串或数组)
+    if let Some(system) = value.get("system") {
+        let system_text = if let Some(s) = system.as_str() {
+            s.to_string()
+        } else if let Some(arr) = system.as_array() {
+            arr.iter()
+                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        } else {
+            String::new()
+        };
+        
+        if !system_text.is_empty() {
+            messages.push(Message {
+                role: "system".to_string(),
+                content: MessageContent::Text(system_text),
+                name: None,
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+            });
+        }
+    }
+
+    // 处理 messages
+    if let Some(msgs) = value.get("messages").and_then(|m| m.as_array()) {
+        for msg in msgs {
+            let role = msg.get("role")
+                .and_then(|r| r.as_str())
+                .unwrap_or("user")
+                .to_string();
+            
+            // content 可能是字符串或数组
+            let content = if let Some(text) = msg.get("content").and_then(|c| c.as_str()) {
+                MessageContent::Text(text.to_string())
+            } else if let Some(parts) = msg.get("content").and_then(|c| c.as_array()) {
+                let content_parts: Vec<crate::models::ContentPart> = parts
+                    .iter()
+                    .filter_map(|p| {
+                        let content_type = p.get("type").and_then(|t| t.as_str()).unwrap_or("text");
+                        if content_type == "text" {
+                            Some(crate::models::ContentPart {
+                                content_type: "text".to_string(),
+                                text: p.get("text").and_then(|t| t.as_str()).map(|s| s.to_string()),
+                                image_url: None,
+                                extra: serde_json::Map::new(),
+                            })
+                        } else if content_type == "image" || content_type == "image_url" {
+                            let url = p.get("image_url")
+                                .and_then(|iu| iu.get("url"))
+                                .and_then(|u| u.as_str())
+                                .map(|s| s.to_string())
+                                .or_else(|| {
+                                    // Claude 格式: source.data
+                                    p.get("source").and_then(|s| {
+                                        let media_type = s.get("media_type").and_then(|m| m.as_str()).unwrap_or("image/png");
+                                        let data = s.get("data").and_then(|d| d.as_str()).unwrap_or("");
+                                        Some(format!("data:{};base64,{}", media_type, data))
+                                    })
+                                });
+                            
+                            Some(crate::models::ContentPart {
+                                content_type: "image_url".to_string(),
+                                text: None,
+                                image_url: url.map(|u| crate::models::ImageUrl { url: u, detail: None }),
+                                extra: serde_json::Map::new(),
+                            })
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                MessageContent::Parts(content_parts)
+            } else {
+                MessageContent::Text(String::new())
+            };
+
+            messages.push(Message {
+                role,
+                content,
+                name: None,
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+            });
+        }
+    }
+
+    ChatRequest {
+        model,
+        messages,
+        stream: value.get("stream").and_then(|v| v.as_bool()).unwrap_or(false),
+        temperature: value.get("temperature").and_then(|v| v.as_f64()).map(|v| v as f32),
+        max_tokens: value.get("max_tokens").and_then(|v| v.as_i64()).map(|v| v as u32),
+        ..Default::default()
+    }
+}
+
 fn claude_to_chat_request(claude_req: &ClaudeMessagesRequest) -> ChatRequest {
     let mut messages = Vec::new();
 
@@ -1703,7 +2012,7 @@ fn claude_to_chat_request(claude_req: &ClaudeMessagesRequest) -> ChatRequest {
         let content = MessageContent::Parts(
             cm.content.iter().flat_map(|c| {
                 match c {
-                    ClaudeContent::Text(text) => {
+                    ClaudeContent::Text { text } => {
                         vec![crate::models::ContentPart {
                             content_type: "text".to_string(),
                             text: Some(text.clone()),
@@ -1786,6 +2095,20 @@ fn claude_to_chat_request(claude_req: &ClaudeMessagesRequest) -> ChatRequest {
         temperature: claude_req.temperature.map(|t| t as f32),
         max_tokens: Some(claude_req.max_tokens as u32),
         tools,
+        // 其他参数使用默认值
+        top_p: None,
+        n: None,
+        stop: None,
+        presence_penalty: None,
+        frequency_penalty: None,
+        logit_bias: None,
+        user: None,
+        tool_choice: None,
+        parallel_tool_calls: None,
+        response_format: None,
+        seed: None,
+        logprobs: None,
+        top_logprobs: None,
         extra: serde_json::Map::new(),
     }
 }
@@ -1861,7 +2184,8 @@ pub async fn handle_embeddings(
 ) -> Response {
     tracing::info!("收到 Embeddings 请求");
     let start_time = Instant::now();
-    let mut log_entry = RequestLog::new("POST".to_string(), "/v1/embeddings".to_string());
+    let mut log_entry = RequestLog::new("POST".to_string(), "/v1/embeddings".to_string())
+        .with_endpoint_type("embeddings".to_string());
 
     let body = match axum::body::to_bytes(request.into_body(), 1024 * 1024).await {
         Ok(b) => b,
@@ -2014,21 +2338,44 @@ pub async fn handle_embeddings(
 
 /// Handle list models request
 pub async fn handle_list_models(State(state): State<Arc<AppState>>) -> Response {
-    // 获取所有可用的 Group 名称作为模型列表
-    let groups = state.get_groups();
-    let models: Vec<serde_json::Value> = groups
-        .iter()
-        .filter(|g| g.is_active)
-        .map(|g| {
-            json!({
-                "id": g.name,
-                "object": "model",
-                "owned_by": "uniroute",
-                "permission": [],
-                "root": g.name
-            })
-        })
-        .collect();
+    // 获取所有 Provider 中配置的模型
+    let providers = state.get_providers();
+    let mut seen_models = std::collections::HashSet::new();
+    let mut models: Vec<serde_json::Value> = Vec::new();
+
+    for provider in providers.iter().filter(|p| p.is_active) {
+        let prefix = &provider.prefix;
+        for mc in &provider.models {
+            // 构建完整模型名：prefix/model_name
+            let full_name = if mc.name == "*" {
+                // 通配符模型，跳过
+                continue;
+            } else if mc.name.contains('/') {
+                // 已有前缀，直接使用
+                mc.name.clone()
+            } else {
+                format!("{}/{}", prefix, mc.name)
+            };
+
+            // 去重
+            if seen_models.insert(full_name.clone()) {
+                models.push(json!({
+                    "id": full_name,
+                    "object": "model",
+                    "owned_by": provider.name,
+                    "permission": [],
+                    "root": provider.name,
+                    "provider": provider.name
+                }));
+            }
+        }
+    }
+
+    // 按 id 排序
+    models.sort_by(|a, b| {
+        a.get("id").and_then(|v| v.as_str()).unwrap_or("")
+            .cmp(b.get("id").and_then(|v| v.as_str()).unwrap_or(""))
+    });
 
     Json(json!({
         "object": "list",

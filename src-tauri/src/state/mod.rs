@@ -6,6 +6,7 @@ use crate::models::{Group, ModelMapping, Provider, ProviderTemplate, QuotaLimit,
 use crate::oauth::OAuthState;
 use crate::pricing::PricingManager;
 use crate::storage::Database;
+use anyhow::{Context, Result};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -108,14 +109,14 @@ pub struct ProxyServerHandle {
 }
 
 impl AppState {
-    pub fn new() -> Self {
+    pub fn new() -> Result<Self> {
         let db = Database::new(Database::default_path())
-            .expect("Failed to initialize database");
+            .context("初始化数据库失败")?;
 
         // 从数据库加载
-        let providers = db.load_providers().unwrap_or_default();
-        let groups = db.load_groups().unwrap_or_default();
-        let model_mappings = db.load_model_mappings().unwrap_or_default();
+        let providers = db.load_providers().context("加载供应商失败")?;
+        let groups = db.load_groups().context("加载组合失败")?;
+        let model_mappings = db.load_model_mappings().context("加载模型映射失败")?;
         let settings = db.load_setting("settings")
             .ok()
             .flatten()
@@ -128,7 +129,7 @@ impl AppState {
             let _ = pricing_manager.load_user_pricing(&pricing_json);
         }
 
-        Self {
+        Ok(Self {
             providers: RwLock::new(providers),
             groups: RwLock::new(groups),
             model_mappings: RwLock::new(model_mappings),
@@ -138,7 +139,7 @@ impl AppState {
             oauth_state: OAuthState::new(),
             pricing_manager: Arc::new(RwLock::new(pricing_manager)),
             group_strategy_state: Arc::new(GroupStrategyState::new()),
-        }
+        })
     }
 
     // ============ Provider 管理 ============
@@ -159,22 +160,25 @@ impl AppState {
         Provider::builtin_templates()
     }
 
-    pub fn add_provider(&self, provider: Provider) {
-        self.db.save_provider(&provider).expect("Failed to save provider");
+    pub fn add_provider(&self, provider: Provider) -> Result<()> {
+        self.db.save_provider(&provider).context("保存供应商失败")?;
         self.providers.write().push(provider);
+        Ok(())
     }
 
-    pub fn update_provider(&self, id: &str, updated: Provider) {
-        self.db.save_provider(&updated).expect("Failed to update provider");
+    pub fn update_provider(&self, id: &str, updated: Provider) -> Result<()> {
+        self.db.save_provider(&updated).context("更新供应商失败")?;
         let mut providers = self.providers.write();
         if let Some(idx) = providers.iter().position(|p| p.id == id) {
             providers[idx] = updated;
         }
+        Ok(())
     }
 
-    pub fn delete_provider(&self, id: &str) {
-        self.db.delete_provider(id).expect("Failed to delete provider");
+    pub fn delete_provider(&self, id: &str) -> Result<()> {
+        self.db.delete_provider(id).context("删除供应商失败")?;
         self.providers.write().retain(|p| p.id != id);
+        Ok(())
     }
 
     // ============ Group 管理 ============
@@ -187,29 +191,36 @@ impl AppState {
         self.groups.read().iter().find(|g| g.id == id).cloned()
     }
 
-    pub fn get_group_by_name(&self, name: &str) -> Option<Group> {
+    pub fn get_group_by_name(&self, name: &str, endpoint_type: Option<&str>) -> Option<Group> {
+        let endpoint = endpoint_type.unwrap_or("chat");
         self.groups.read()
             .iter()
-            .find(|g| g.name == name && g.is_active)
+            .find(|g| {
+                let g_endpoint = g.endpoint_type.as_deref().unwrap_or("chat");
+                g.name == name && g_endpoint == endpoint && g.is_active
+            })
             .cloned()
     }
 
-    pub fn add_group(&self, group: Group) {
-        self.db.save_group(&group).expect("Failed to save group");
+    pub fn add_group(&self, group: Group) -> anyhow::Result<()> {
+        self.db.save_group(&group).context("保存组合失败")?;
         self.groups.write().push(group);
+        Ok(())
     }
 
-    pub fn update_group(&self, id: &str, updated: Group) {
-        self.db.save_group(&updated).expect("Failed to update group");
+    pub fn update_group(&self, id: &str, updated: Group) -> anyhow::Result<()> {
+        self.db.save_group(&updated)?;
         let mut groups = self.groups.write();
         if let Some(idx) = groups.iter().position(|g| g.id == id) {
             groups[idx] = updated;
         }
+        Ok(())
     }
 
-    pub fn delete_group(&self, id: &str) {
-        self.db.delete_group(id).expect("Failed to delete group");
+    pub fn delete_group(&self, id: &str) -> anyhow::Result<()> {
+        self.db.delete_group(id).context("删除组合失败")?;
         self.groups.write().retain(|g| g.id != id);
+        Ok(())
     }
 
     // ============ Model Mapping 管理 ============
@@ -218,14 +229,16 @@ impl AppState {
         self.model_mappings.read().clone()
     }
 
-    pub fn add_model_mapping(&self, mapping: ModelMapping) {
-        self.db.save_model_mapping(&mapping).expect("Failed to save mapping");
+    pub fn add_model_mapping(&self, mapping: ModelMapping) -> anyhow::Result<()> {
+        self.db.save_model_mapping(&mapping).context("保存模型映射失败")?;
         self.model_mappings.write().push(mapping);
+        Ok(())
     }
 
-    pub fn delete_model_mapping(&self, id: &str) {
-        self.db.delete_model_mapping(id).expect("Failed to delete mapping");
+    pub fn delete_model_mapping(&self, id: &str) -> anyhow::Result<()> {
+        self.db.delete_model_mapping(id).context("删除模型映射失败")?;
         self.model_mappings.write().retain(|m| m.id != id);
+        Ok(())
     }
 
     // ============ 设置管理 ============
@@ -367,6 +380,6 @@ impl AppState {
 
 impl Default for AppState {
     fn default() -> Self {
-        Self::new()
+        Self::new().expect("初始化应用状态失败")
     }
 }

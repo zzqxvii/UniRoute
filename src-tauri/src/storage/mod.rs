@@ -211,6 +211,44 @@ impl Database {
             )?;
         }
 
+        if !columns.contains(&"original_input_tokens".to_string()) {
+            tracing::info!("添加 original_input_tokens 列到 request_logs 表");
+            db.execute(
+                "ALTER TABLE request_logs ADD COLUMN original_input_tokens INTEGER",
+                [],
+            )?;
+        }
+
+        if !columns.contains(&"translated_input_tokens".to_string()) {
+            tracing::info!("添加 translated_input_tokens 列到 request_logs 表");
+            db.execute(
+                "ALTER TABLE request_logs ADD COLUMN translated_input_tokens INTEGER",
+                [],
+            )?;
+        }
+
+        if !columns.contains(&"endpoint_type".to_string()) {
+            tracing::info!("添加 endpoint_type 列到 request_logs 表");
+            db.execute(
+                "ALTER TABLE request_logs ADD COLUMN endpoint_type TEXT",
+                [],
+            )?;
+        }
+
+        // 添加 currency 列到 providers 表
+        let provider_columns: Vec<String> = db
+            .prepare("PRAGMA table_info(providers)")?
+            .query_map([], |row| row.get(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        if !provider_columns.contains(&"currency".to_string()) {
+            tracing::info!("添加 currency 列到 providers 表");
+            db.execute(
+                "ALTER TABLE providers ADD COLUMN currency TEXT NOT NULL DEFAULT 'CNY'",
+                [],
+            )?;
+        }
+
         // 检查 providers 表是否存在
         let providers_columns: Vec<String> = db
             .prepare("PRAGMA table_info(providers)")?
@@ -255,6 +293,69 @@ impl Database {
             }
         }
 
+        // 检查 group_models 表是否存在 enabled 列
+        let group_models_columns: Vec<String> = db
+            .prepare("PRAGMA table_info(group_models)")?
+            .query_map([], |row| row.get(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        if !group_models_columns.contains(&"enabled".to_string()) {
+            tracing::info!("添加 enabled 列到 group_models 表");
+            db.execute(
+                "ALTER TABLE group_models ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1",
+                [],
+            )?;
+        }
+
+        // 添加 endpoint_type 列到 groups 表
+        let groups_columns: Vec<String> = db
+            .prepare("SELECT name FROM pragma_table_info('groups')")?
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        if !groups_columns.contains(&"endpoint_type".to_string()) {
+            tracing::info!("添加 endpoint_type 列到 groups 表");
+            db.execute(
+                "ALTER TABLE groups ADD COLUMN endpoint_type TEXT",
+                [],
+            )?;
+        }
+
+        // 重建 groups 表，移除 name UNIQUE 约束，改为 (name, endpoint_type) 复合唯一
+        // 检查是否还有 name 的 UNIQUE 约束
+        let has_name_unique: bool = db
+            .prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='groups'")?
+            .query_row([], |row| {
+                let sql: String = row.get(0)?;
+                Ok(sql.contains("name TEXT NOT NULL UNIQUE"))
+            })?;
+
+        if has_name_unique {
+            tracing::info!("重建 groups 表，修改唯一约束为 (name, endpoint_type)");
+            db.execute_batch(&[
+                // 1. 创建新表
+                "CREATE TABLE groups_new (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    description TEXT,
+                    strategy TEXT NOT NULL DEFAULT 'priority',
+                    config TEXT,
+                    is_active INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    endpoint_type TEXT
+                )",
+                // 2. 复制数据
+                "INSERT INTO groups_new SELECT id, name, description, strategy, config, is_active, created_at, updated_at, endpoint_type FROM groups",
+                // 3. 删除旧表
+                "DROP TABLE groups",
+                // 4. 重命名新表
+                "ALTER TABLE groups_new RENAME TO groups",
+                // 5. 创建复合唯一索引
+                "CREATE UNIQUE INDEX idx_groups_name_endpoint ON groups(name, COALESCE(endpoint_type, 'chat'))",
+            ].join("; "))?;
+        }
+
         Ok(())
     }
 
@@ -263,10 +364,10 @@ impl Database {
     pub fn save_provider(&self, provider: &Provider) -> Result<()> {
         let db = self.conn.lock().unwrap();
         db.execute(
-            r#"INSERT INTO providers (id, name, prefix, base_url, api_key, api_format, models, enable_cost, auth_type, oauth_config, oauth_tokens, headers, auth_header, auth_prefix, is_active, is_builtin, created_at, updated_at)
-               VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)
+            r#"INSERT INTO providers (id, name, prefix, base_url, api_key, api_format, models, enable_cost, currency, auth_type, oauth_config, oauth_tokens, headers, auth_header, auth_prefix, is_active, is_builtin, created_at, updated_at)
+               VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)
                ON CONFLICT(id) DO UPDATE SET
-                 name=?2, prefix=?3, base_url=?4, api_key=?5, api_format=?6, models=?7, enable_cost=?8, auth_type=?9, oauth_config=?10, oauth_tokens=?11, headers=?12, auth_header=?13, auth_prefix=?14, is_active=?15, updated_at=?18"#,
+                 name=?2, prefix=?3, base_url=?4, api_key=?5, api_format=?6, models=?7, enable_cost=?8, currency=?9, auth_type=?10, oauth_config=?11, oauth_tokens=?12, headers=?13, auth_header=?14, auth_prefix=?15, is_active=?16, updated_at=?19"#,
             rusqlite::params![
                 provider.id,
                 provider.name,
@@ -276,6 +377,7 @@ impl Database {
                 serde_json::to_string(&provider.api_format)?,
                 serde_json::to_string(&provider.models)?,
                 provider.enable_cost as i32,
+                &provider.currency,
                 serde_json::to_string(&provider.auth_type)?,
                 provider.oauth.as_ref().map(|o| serde_json::to_string(o).ok()).flatten(),
                 provider.oauth_tokens.as_ref().map(|t| serde_json::to_string(t).ok()).flatten(),
@@ -294,21 +396,22 @@ impl Database {
     pub fn load_providers(&self) -> Result<Vec<Provider>> {
         let db = self.conn.lock().unwrap();
         let mut stmt = db.prepare(
-            "SELECT id, name, prefix, base_url, api_key, api_format, models, enable_cost, auth_type, oauth_config, oauth_tokens, headers, auth_header, auth_prefix, is_active, is_builtin, created_at, updated_at
+            "SELECT id, name, prefix, base_url, api_key, api_format, models, enable_cost, currency, auth_type, oauth_config, oauth_tokens, headers, auth_header, auth_prefix, is_active, is_builtin, created_at, updated_at
              FROM providers ORDER BY name"
         )?;
         let providers = stmt
             .query_map([], |row| {
                 let api_format_str: String = row.get(5)?;
                 let models_str: String = row.get(6)?;
-                let auth_type_str: Option<String> = row.get(8)?;
-                let oauth_config_str: Option<String> = row.get(9)?;
-                let oauth_tokens_str: Option<String> = row.get(10)?;
-                let headers_str: Option<String> = row.get(11)?;
-                let auth_header: Option<String> = row.get(12)?;
-                let auth_prefix: Option<String> = row.get(13)?;
-                let created_str: String = row.get(16)?;
-                let updated_str: String = row.get(17)?;
+                let auth_type_str: Option<String> = row.get(9)?;
+                let oauth_config_str: Option<String> = row.get(10)?;
+                let oauth_tokens_str: Option<String> = row.get(11)?;
+                let headers_str: Option<String> = row.get(12)?;
+                let auth_header: Option<String> = row.get(13)?;
+                let auth_prefix: Option<String> = row.get(14)?;
+                let currency: String = row.get(8).unwrap_or_else(|_| "CNY".to_string());
+                let created_str: String = row.get(17)?;
+                let updated_str: String = row.get(18)?;
 
                 // 尝试解析新格式的 models (ModelConfig)，如果失败则尝试旧格式 (String)
                 let models: Vec<crate::models::ModelConfig> =
@@ -354,14 +457,15 @@ impl Database {
                         .get::<_, Option<i32>>(7)?
                         .map(|v| v != 0)
                         .unwrap_or(false),
+                    currency,
                     auth_type,
                     oauth,
                     oauth_tokens,
                     headers,
                     auth_header: auth_header.unwrap_or_else(|| "Authorization".to_string()),
                     auth_prefix,
-                    is_active: row.get::<_, i32>(14)? != 0,
-                    is_builtin: row.get::<_, i32>(15)? != 0,
+                    is_active: row.get::<_, i32>(15)? != 0,
+                    is_builtin: row.get::<_, i32>(16)? != 0,
                     created_at: parse_dt(&created_str),
                     updated_at: parse_dt(&updated_str),
                 })
@@ -373,20 +477,21 @@ impl Database {
     pub fn get_provider_by_prefix(&self, prefix: &str) -> Result<Option<Provider>> {
         let db = self.conn.lock().unwrap();
         let result = db.query_row(
-            "SELECT id, name, prefix, base_url, api_key, api_format, models, enable_cost, auth_type, oauth_config, oauth_tokens, headers, auth_header, auth_prefix, is_active, is_builtin, created_at, updated_at
+            "SELECT id, name, prefix, base_url, api_key, api_format, models, enable_cost, currency, auth_type, oauth_config, oauth_tokens, headers, auth_header, auth_prefix, is_active, is_builtin, created_at, updated_at
              FROM providers WHERE prefix=?1",
             [prefix],
             |row| {
                 let api_format_str: String = row.get(5)?;
                 let models_str: String = row.get(6)?;
-                let auth_type_str: Option<String> = row.get(8)?;
-                let oauth_config_str: Option<String> = row.get(9)?;
-                let oauth_tokens_str: Option<String> = row.get(10)?;
-                let headers_str: Option<String> = row.get(11)?;
-                let auth_header: Option<String> = row.get(12)?;
-                let auth_prefix: Option<String> = row.get(13)?;
-                let created_str: String = row.get(16)?;
-                let updated_str: String = row.get(17)?;
+                let currency: String = row.get(8).unwrap_or_else(|_| "CNY".to_string());
+                let auth_type_str: Option<String> = row.get(9)?;
+                let oauth_config_str: Option<String> = row.get(10)?;
+                let oauth_tokens_str: Option<String> = row.get(11)?;
+                let headers_str: Option<String> = row.get(12)?;
+                let auth_header: Option<String> = row.get(13)?;
+                let auth_prefix: Option<String> = row.get(14)?;
+                let created_str: String = row.get(17)?;
+                let updated_str: String = row.get(18)?;
 
                 // 尝试解析新格式的 models，如果失败则尝试旧格式
                 let models: Vec<crate::models::ModelConfig> = if models_str.starts_with('[') && models_str.contains("\"name\"") {
@@ -419,14 +524,15 @@ impl Database {
                     api_format: serde_json::from_str(&api_format_str).unwrap_or(ApiFormat::OpenAI),
                     models,
                     enable_cost: row.get::<_, Option<i32>>(7)?.map(|v| v != 0).unwrap_or(false),
+                    currency,
                     auth_type,
                     oauth,
                     oauth_tokens,
                     headers,
                     auth_header: auth_header.unwrap_or_else(|| "Authorization".to_string()),
                     auth_prefix,
-                    is_active: row.get::<_, i32>(14)? != 0,
-                    is_builtin: row.get::<_, i32>(15)? != 0,
+                    is_active: row.get::<_, i32>(15)? != 0,
+                    is_builtin: row.get::<_, i32>(16)? != 0,
                     created_at: parse_dt(&created_str),
                     updated_at: parse_dt(&updated_str),
                 })
@@ -448,10 +554,10 @@ impl Database {
     pub fn save_group(&self, group: &Group) -> Result<()> {
         let db = self.conn.lock().unwrap();
         db.execute(
-            r#"INSERT INTO groups (id, name, description, strategy, config, is_active, created_at, updated_at)
-               VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
+            r#"INSERT INTO groups (id, name, description, strategy, config, is_active, created_at, updated_at, endpoint_type)
+               VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
                ON CONFLICT(id) DO UPDATE SET
-                 name=?2, description=?3, strategy=?4, config=?5, is_active=?6, updated_at=?8"#,
+                 name=?2, description=?3, strategy=?4, config=?5, is_active=?6, updated_at=?8, endpoint_type=?9"#,
             rusqlite::params![
                 group.id, group.name, group.description,
                 serde_json::to_string(&group.strategy)?,
@@ -459,15 +565,22 @@ impl Database {
                 group.is_active as i32,
                 group.created_at.to_rfc3339(),
                 group.updated_at.to_rfc3339(),
+                group.endpoint_type,
             ],
-        )?;
+        ).map_err(|e| {
+            if e.to_string().contains("UNIQUE constraint failed") {
+                anyhow::anyhow!("该端点类型下已存在同名组合")
+            } else {
+                anyhow::anyhow!("数据库错误: {}", e)
+            }
+        })?;
 
         db.execute("DELETE FROM group_models WHERE group_id=?1", [&group.id])?;
 
         for m in &group.models {
             db.execute(
-                "INSERT INTO group_models (group_id, model, weight, priority) VALUES (?1,?2,?3,?4)",
-                rusqlite::params![group.id, m.model, m.weight, m.priority],
+                "INSERT INTO group_models (group_id, model, weight, priority, enabled) VALUES (?1,?2,?3,?4,?5)",
+                rusqlite::params![group.id, m.model, m.weight, m.priority, m.enabled as i32],
             )?;
         }
 
@@ -477,7 +590,7 @@ impl Database {
     pub fn load_groups(&self) -> Result<Vec<Group>> {
         let db = self.conn.lock().unwrap();
         let mut stmt = db.prepare(
-            "SELECT id, name, description, strategy, config, is_active, created_at, updated_at FROM groups ORDER BY name"
+            "SELECT id, name, description, strategy, config, is_active, created_at, updated_at, endpoint_type FROM groups ORDER BY name"
         )?;
         let groups = stmt
             .query_map([], |row| {
@@ -495,6 +608,7 @@ impl Database {
                     created_at: parse_dt(&created_str),
                     updated_at: parse_dt(&updated_str),
                     models: Vec::new(),
+                    endpoint_type: row.get(8)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -503,7 +617,7 @@ impl Database {
         let mut result = groups;
         for group in &mut result {
             let mut model_stmt = db.prepare(
-                "SELECT model, weight, priority FROM group_models WHERE group_id=?1 ORDER BY priority"
+                "SELECT model, weight, priority, enabled FROM group_models WHERE group_id=?1 ORDER BY priority"
             )?;
             group.models = model_stmt
                 .query_map([&group.id], |row| {
@@ -511,6 +625,7 @@ impl Database {
                         model: row.get(0)?,
                         weight: row.get(1)?,
                         priority: row.get(2)?,
+                        enabled: row.get::<_, i32>(3)? != 0,
                     })
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
@@ -653,8 +768,8 @@ impl Database {
         let db = self.conn.lock().unwrap();
         db.execute(
             r#"INSERT INTO request_logs
-               (timestamp, method, path, requested_model, model, provider, provider_prefix, url, protocol_transform, status_code, latency_ms, first_token_ms, prompt_tokens, completion_tokens, cost, error, original_request_body, request_body, original_response_body, response_body)
-               VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)"#,
+               (timestamp, method, path, requested_model, model, provider, provider_prefix, url, protocol_transform, endpoint_type, status_code, latency_ms, first_token_ms, prompt_tokens, completion_tokens, original_input_tokens, translated_input_tokens, cost, error, original_request_body, request_body, original_response_body, response_body)
+               VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)"#,
             rusqlite::params![
                 log.timestamp.to_rfc3339(),
                 log.method,
@@ -665,11 +780,14 @@ impl Database {
                 log.provider_prefix,
                 log.url,
                 log.protocol_transform,
+                log.endpoint_type,
                 log.status_code,
                 log.latency_ms,
                 log.first_token_ms,
                 log.prompt_tokens,
                 log.completion_tokens,
+                log.original_input_tokens,
+                log.translated_input_tokens,
                 log.cost,
                 log.error,
                 log.original_request_body,
@@ -684,7 +802,7 @@ impl Database {
     pub fn load_request_logs(&self, limit: i64, offset: i64) -> Result<Vec<RequestLog>> {
         let db = self.conn.lock().unwrap();
         let mut stmt = db.prepare(
-            "SELECT id, timestamp, method, path, requested_model, model, provider, provider_prefix, url, protocol_transform, status_code, latency_ms, first_token_ms, prompt_tokens, completion_tokens, cost, error, original_request_body, request_body, original_response_body, response_body
+            "SELECT id, timestamp, method, path, requested_model, model, provider, provider_prefix, url, protocol_transform, endpoint_type, status_code, latency_ms, first_token_ms, prompt_tokens, completion_tokens, original_input_tokens, translated_input_tokens, cost, error, original_request_body, request_body, original_response_body, response_body
              FROM request_logs ORDER BY timestamp DESC LIMIT ?1 OFFSET ?2"
         )?;
         let logs = stmt
@@ -701,17 +819,20 @@ impl Database {
                     provider_prefix: row.get(7)?,
                     url: row.get(8)?,
                     protocol_transform: row.get(9)?,
-                    status_code: row.get(10)?,
-                    latency_ms: row.get(11)?,
-                    first_token_ms: row.get(12)?,
-                    prompt_tokens: row.get(13)?,
-                    completion_tokens: row.get(14)?,
-                    cost: row.get(15)?,
-                    error: row.get(16)?,
-                    original_request_body: row.get(17)?,
-                    request_body: row.get(18)?,
-                    original_response_body: row.get(19)?,
-                    response_body: row.get(20)?,
+                    endpoint_type: row.get(10)?,
+                    status_code: row.get(11)?,
+                    latency_ms: row.get(12)?,
+                    first_token_ms: row.get(13)?,
+                    prompt_tokens: row.get(14)?,
+                    completion_tokens: row.get(15)?,
+                    original_input_tokens: row.get(16)?,
+                    translated_input_tokens: row.get(17)?,
+                    cost: row.get(18)?,
+                    error: row.get(19)?,
+                    original_request_body: row.get(20)?,
+                    request_body: row.get(21)?,
+                    original_response_body: row.get(22)?,
+                    response_body: row.get(23)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -911,6 +1032,75 @@ impl Database {
         )?;
         Ok(cost)
     }
+
+    /// 获取最近24小时流量统计
+    pub fn get_hourly_traffic(&self, hours: i64) -> Result<Vec<HourlyTraffic>> {
+        let db = self.conn.lock().unwrap();
+        let mut stmt = db.prepare(
+            r#"SELECT 
+                strftime('%Y-%m-%d %H:00', timestamp) as hour,
+                COUNT(*) as request_count,
+                SUM(COALESCE(prompt_tokens, 0) + COALESCE(completion_tokens, 0)) as total_tokens,
+                SUM(COALESCE(cost, 0)) as total_cost
+               FROM request_logs
+               WHERE timestamp >= datetime('now', '-' || ?1 || ' hours')
+               GROUP BY strftime('%Y-%m-%d %H', timestamp)
+               ORDER BY hour ASC"#,
+        )?;
+        let stats = stmt
+            .query_map([hours], |row| {
+                Ok(HourlyTraffic {
+                    hour: row.get(0)?,
+                    request_count: row.get(1)?,
+                    total_tokens: row.get(2)?,
+                    total_cost: row.get(3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(stats)
+    }
+
+    /// 获取供应商健康状态
+    pub fn get_provider_health(&self, hours: i64) -> Result<Vec<ProviderHealth>> {
+        let db = self.conn.lock().unwrap();
+        let mut stmt = db.prepare(
+            r#"SELECT 
+                COALESCE(provider, '未知') as provider,
+                COALESCE(provider_prefix, 'unknown') as provider_prefix,
+                COUNT(*) as request_count,
+                SUM(CASE WHEN status_code >= 200 AND status_code < 300 THEN 1 ELSE 0 END) as success_count,
+                SUM(CASE WHEN status_code >= 400 OR status_code = 0 THEN 1 ELSE 0 END) as failed_count,
+                AVG(CASE WHEN status_code >= 200 AND status_code < 300 THEN latency_ms ELSE NULL END) as avg_latency_ms,
+                SUM(COALESCE(cost, 0)) as total_cost
+               FROM request_logs
+               WHERE timestamp >= datetime('now', '-' || ?1 || ' hours')
+               GROUP BY COALESCE(provider_prefix, 'unknown')
+               ORDER BY request_count DESC"#,
+        )?;
+        let stats = stmt
+            .query_map([hours], |row| {
+                let request_count: i64 = row.get(2)?;
+                let success_count: i64 = row.get(3)?;
+                let failed_count: i64 = row.get(4)?;
+                let success_rate = if request_count > 0 {
+                    (success_count as f64 / request_count as f64) * 100.0
+                } else {
+                    0.0
+                };
+                Ok(ProviderHealth {
+                    provider: row.get(0)?,
+                    provider_prefix: row.get(1)?,
+                    request_count,
+                    success_count,
+                    failed_count,
+                    success_rate,
+                    avg_latency_ms: row.get::<_, Option<f64>>(5)?.unwrap_or(0.0),
+                    total_cost: row.get::<_, Option<f64>>(6)?.unwrap_or(0.0),
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(stats)
+    }
 }
 
 fn parse_dt(s: &str) -> chrono::DateTime<chrono::Utc> {
@@ -934,4 +1124,26 @@ pub struct ImportResult {
     pub groups_imported: usize,
     pub mappings_imported: usize,
     pub errors: Vec<String>,
+}
+
+/// 按小时流量统计
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct HourlyTraffic {
+    pub hour: String,
+    pub request_count: i64,
+    pub total_tokens: i64,
+    pub total_cost: f64,
+}
+
+/// 供应商健康状态
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ProviderHealth {
+    pub provider: String,
+    pub provider_prefix: String,
+    pub request_count: i64,
+    pub success_count: i64,
+    pub failed_count: i64,
+    pub success_rate: f64,
+    pub avg_latency_ms: f64,
+    pub total_cost: f64,
 }

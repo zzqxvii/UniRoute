@@ -6,9 +6,15 @@ interface ModelPricing {
   output: number;
 }
 
+// 端点能力类型
+type EndpointCapability = 'chat' | 'responses' | 'claude' | 'gemini' | 'embeddings' | 'images' | 'videos' | 'music' | 'audio' | 'tts' | 'moderation' | 'rerank';
+
 interface ModelConfig {
   name: string;
   pricing?: ModelPricing;
+  endpoints?: EndpointCapability[];
+  rpm?: number;
+  tpm?: number;
 }
 
 interface OAuthConfig {
@@ -37,6 +43,7 @@ interface Provider {
   api_format: string;
   models: ModelConfig[];
   enable_cost: boolean;
+  currency: string;
   auth_type: 'api_key' | 'oauth';
   oauth?: OAuthConfig;
   oauth_tokens?: OAuthTokens;
@@ -73,6 +80,19 @@ interface ProviderTestResult {
   latency_ms: number | null;
 }
 
+// 端点测试结果
+interface EndpointTestResult {
+  provider_id: string;
+  provider_name: string;
+  model: string;
+  endpoint: string;
+  success: boolean;
+  latency_ms: number;
+  status_code?: number;
+  error?: string;
+  response_preview?: string;
+}
+
 interface OAuthFlowStatus {
   device_code: string;
   user_code: string;
@@ -99,6 +119,10 @@ function Providers() {
   const [testingId, setTestingId] = useState<string | null>(null);
   const [testResults, setTestResults] = useState<Record<string, ProviderTestResult>>({});
   const [oauthStatus, setOauthStatus] = useState<Record<string, OAuthProviderStatus>>({});
+
+  // 端点测试状态
+  const [testingEndpoint, setTestingEndpoint] = useState<{ providerId: string; model: string; endpoint: string } | null>(null);
+  const [endpointTestResults, setEndpointTestResults] = useState<Record<string, EndpointTestResult>>({});
 
   useEffect(() => {
     loadData();
@@ -160,6 +184,35 @@ function Providers() {
     }
   };
 
+  // 测试模型端点
+  const handleTestEndpoint = async (providerId: string, model: string, endpoint: EndpointCapability) => {
+    const key = `${providerId}:${model}:${endpoint}`;
+    setTestingEndpoint({ providerId, model, endpoint });
+    try {
+      const result = await invoke<EndpointTestResult>('test_model_endpoint', {
+        providerId,
+        model,
+        endpoint,
+      });
+      setEndpointTestResults(prev => ({ ...prev, [key]: result }));
+    } catch (error) {
+      setEndpointTestResults(prev => ({
+        ...prev,
+        [key]: {
+          provider_id: providerId,
+          provider_name: '',
+          model,
+          endpoint,
+          success: false,
+          latency_ms: 0,
+          error: String(error),
+        },
+      }));
+    } finally {
+      setTestingEndpoint(null);
+    }
+  };
+
   const handleCreateFromTemplate = async (template: ProviderTemplate) => {
     // 处理 models 字段：可能是 ModelConfig[] 或 string[]
     const models: ModelConfig[] = template.models.map(m =>
@@ -175,6 +228,7 @@ function Providers() {
       api_format: template.api_format,
       models: models,
       enable_cost: false,
+      currency: 'CNY',
       auth_type: template.auth_type,
       oauth: template.oauth,
       headers: template.headers || {},
@@ -209,18 +263,6 @@ function Providers() {
           >
             + 添加供应商
           </button>
-        </div>
-      </div>
-
-      {/* 说明 */}
-      <div className="mb-6 bg-gradient-to-r from-blue-50 to-indigo-50 dark:from-blue-900/20 dark:to-indigo-900/20 border border-blue-200 dark:border-blue-800 rounded-xl p-4">
-        <h3 className="text-sm font-semibold text-blue-800 dark:text-blue-200 mb-2">
-          使用方式
-        </h3>
-        <div className="text-sm text-blue-700 dark:text-blue-300 space-y-1">
-          <p>1. 添加供应商，设置 <strong>前缀</strong>（如 ds、qf）</p>
-          <p>2. 在 Group 中配置：<code className="bg-blue-100 dark:bg-blue-800 px-1 rounded">前缀/模型名</code></p>
-          <p>3. 请求时使用 Group 名称，系统自动路由到对应供应商</p>
         </div>
       </div>
 
@@ -313,17 +355,66 @@ function Providers() {
                       所有模型 (*)
                     </span>
                   ) : (
-                    provider.models.slice(0, 8).map((model) => (
-                      <span
-                        key={model.name}
-                        className="px-2.5 py-1 bg-blue-50 dark:bg-blue-900/30 text-blue-700 dark:text-blue-300 text-xs rounded-full font-mono"
-                      >
-                        {model.name}
-                        {model.pricing && model.pricing.input > 0 && (
-                          <span className="ml-1 text-amber-600 dark:text-amber-400">${model.pricing.input}/${model.pricing.output}</span>
-                        )}
-                      </span>
-                    ))
+                    provider.models.slice(0, 8).map((model) => {
+                      const endpoints = model.endpoints || ['chat'];
+                      return (
+                        <div key={model.name} className="group relative">
+                          <div className="flex items-center gap-1 px-2.5 py-1 bg-blue-50 dark:bg-blue-900/30 text-blue-700 dark:text-blue-300 text-xs rounded-full font-mono">
+                            {model.name}
+                            {/* 端点能力标签 */}
+                            <span className="flex gap-0.5 ml-1">
+                              {endpoints.slice(0, 3).map(ep => {
+                                const info = ENDPOINT_LABELS[ep];
+                                return (
+                                  <span key={ep} className={`px-1 text-[9px] rounded ${info?.color || 'bg-gray-100 text-gray-500'}`}>
+                                    {info?.shortLabel || ep}
+                                  </span>
+                                );
+                              })}
+                              {endpoints.length > 3 && <span className="text-gray-400 text-[9px]">+{endpoints.length - 3}</span>}
+                            </span>
+                            {/* RPM 限制 */}
+                            {model.rpm && (
+                              <span className="ml-1 px-1 bg-orange-100 dark:bg-orange-900/30 text-orange-600 dark:text-orange-400 text-[9px] rounded" title={`${model.rpm} RPM`}>
+                                {model.rpm}
+                              </span>
+                            )}
+                            {/* 价格 */}
+                            {model.pricing && model.pricing.input > 0 && (
+                              <span className="ml-1 text-amber-600 dark:text-amber-400">${model.pricing.input}/${model.pricing.output}</span>
+                            )}
+                          </div>
+                          {/* 悬停时显示测试按钮 */}
+                          <div className="absolute left-0 top-full mt-1 z-10 hidden group-hover:flex gap-1 bg-white dark:bg-gray-800 p-1.5 rounded-lg shadow-lg border border-gray-200 dark:border-gray-700">
+                            {COMMON_ENDPOINTS.slice(0, 4).map(ep => {
+                              const testKey = `${provider.id}:${model.name}:${ep}`;
+                              const testResult = endpointTestResults[testKey];
+                              const isTesting = testingEndpoint?.providerId === provider.id &&
+                                testingEndpoint?.model === model.name &&
+                                testingEndpoint?.endpoint === ep;
+                              const epInfo = ENDPOINT_LABELS[ep];
+                              return (
+                                <button
+                                  key={ep}
+                                  onClick={(e) => { e.stopPropagation(); handleTestEndpoint(provider.id, model.name, ep); }}
+                                  disabled={isTesting}
+                                  className={`px-1.5 py-0.5 text-[9px] font-medium rounded transition-all ${
+                                    testResult?.success
+                                      ? 'bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-400 ring-1 ring-green-400'
+                                      : testResult && !testResult.success
+                                      ? 'bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-400 ring-1 ring-red-400'
+                                      : 'bg-gray-100 dark:bg-gray-700 text-gray-600 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-600'
+                                  }`}
+                                  title={`${epInfo.label}${testResult ? ` - ${testResult.latency_ms}ms` : ''}`}
+                                >
+                                  {isTesting ? '...' : epInfo.shortLabel}
+                                </button>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      );
+                    })
                   )}
                   {provider.models.length > 8 && (
                     <span className="px-2.5 py-1 bg-gray-100 dark:bg-gray-600 text-gray-500 dark:text-gray-400 text-xs rounded-full">
@@ -415,7 +506,7 @@ function Providers() {
       {/* 模板选择模态框 */}
       {showTemplates && (
         <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4" onClick={(e) => e.target === e.currentTarget && setShowTemplates(false)}>
-          <div className="bg-white dark:bg-gray-800 rounded-xl shadow-2xl w-full max-w-2xl max-h-[80vh] overflow-hidden">
+          <div className="bg-white dark:bg-gray-800 rounded-xl shadow-2xl w-full max-w-4xl max-h-[80vh] overflow-hidden">
             <div className="px-6 py-4 border-b border-gray-200 dark:border-gray-700">
               <h3 className="text-lg font-semibold text-gray-900 dark:text-white">选择供应商模板</h3>
               <p className="text-sm text-gray-500 dark:text-gray-400 mt-1">从预定义模板快速创建供应商</p>
@@ -452,6 +543,177 @@ function Providers() {
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+// 端点标签映射
+const ENDPOINT_LABELS: Record<string, { label: string; shortLabel: string; color: string }> = {
+  chat: { label: 'Chat', shortLabel: 'Chat', color: 'bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400' },
+  responses: { label: 'Responses', shortLabel: 'Responses', color: 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400' },
+  claude: { label: 'Claude', shortLabel: 'Claude', color: 'bg-orange-100 text-orange-700 dark:bg-orange-900/30 dark:text-orange-400' },
+  gemini: { label: 'Gemini', shortLabel: 'Gemini', color: 'bg-indigo-100 text-indigo-700 dark:bg-indigo-900/30 dark:text-indigo-400' },
+  embeddings: { label: '嵌入', shortLabel: '嵌入', color: 'bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400' },
+  images: { label: '图像', shortLabel: '图像', color: 'bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-400' },
+  videos: { label: '视频', shortLabel: '视频', color: 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400' },
+  music: { label: '音乐', shortLabel: '音乐', color: 'bg-rose-100 text-rose-700 dark:bg-rose-900/30 dark:text-rose-400' },
+  audio: { label: '语音(ASR)', shortLabel: 'ASR', color: 'bg-pink-100 text-pink-700 dark:bg-pink-900/30 dark:text-pink-400' },
+  tts: { label: '语音合成', shortLabel: 'TTS', color: 'bg-cyan-100 text-cyan-700 dark:bg-cyan-900/30 dark:text-cyan-400' },
+  moderation: { label: '审核', shortLabel: '审核', color: 'bg-slate-100 text-slate-700 dark:bg-slate-900/30 dark:text-slate-400' },
+  rerank: { label: '重排', shortLabel: '重排', color: 'bg-teal-100 text-teal-700 dark:bg-teal-900/30 dark:text-teal-400' },
+};
+
+// 常用端点（用于 UI 显示）
+const COMMON_ENDPOINTS: EndpointCapability[] = ['chat', 'responses', 'claude', 'gemini', 'embeddings', 'images', 'audio', 'tts'];
+
+// 模型卡片组件
+function ModelCard({
+  model,
+  enableCost,
+  providerId,
+  onToggleEndpoint,
+  onUpdateRpm,
+  onUpdatePricing,
+  onRemove,
+}: {
+  model: ModelConfig;
+  enableCost: boolean;
+  providerId: string;
+  onToggleEndpoint: (ep: EndpointCapability) => void;
+  onUpdateRpm: (rpm: number | undefined) => void;
+  onUpdatePricing: (field: 'input' | 'output', val: string) => void;
+  onRemove: () => void;
+}) {
+  const [testingEndpoint, setTestingEndpoint] = useState<EndpointCapability | null>(null);
+  const [testResults, setTestResults] = useState<Record<string, EndpointTestResult>>({});
+
+  const handleTest = async (endpoint: EndpointCapability) => {
+    if (!providerId) return;
+    setTestingEndpoint(endpoint);
+    try {
+      const result = await invoke<EndpointTestResult>('test_model_endpoint', {
+        providerId,
+        model: model.name,
+        endpoint,
+      });
+      setTestResults(prev => ({ ...prev, [endpoint]: result }));
+    } catch (e) {
+      setTestResults(prev => ({
+        ...prev,
+        [endpoint]: {
+          provider_id: providerId,
+          provider_name: '',
+          model: model.name,
+          endpoint,
+          success: false,
+          latency_ms: 0,
+          error: String(e),
+        },
+      }));
+    } finally {
+      setTestingEndpoint(null);
+    }
+  };
+
+  const endpoints = model.endpoints || ['chat'];
+
+  return (
+    <div className="bg-gray-50 dark:bg-gray-700/30 rounded-lg p-3 space-y-2">
+      {/* 第一行：模型名 + 操作按钮 */}
+      <div className="flex items-center justify-between">
+        <span className="font-mono text-sm text-gray-900 dark:text-white font-medium">{model.name}</span>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={() => handleTest('chat')}
+            disabled={!providerId || testingEndpoint !== null}
+            className="px-2 py-0.5 text-[10px] bg-cyan-100 dark:bg-cyan-900/30 text-cyan-700 dark:text-cyan-400 rounded hover:bg-cyan-200 dark:hover:bg-cyan-900/50 transition-colors disabled:opacity-50"
+          >
+            {testingEndpoint ? '测试中...' : '测试'}
+          </button>
+          <button
+            type="button"
+            onClick={onRemove}
+            className="text-gray-400 hover:text-red-500 transition-colors"
+            title="删除"
+          >
+            <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+            </svg>
+          </button>
+        </div>
+      </div>
+
+      {/* 第二行：端点能力 */}
+      <div className="flex flex-wrap items-center gap-1">
+        <span className="text-[10px] text-gray-400 mr-1">端点:</span>
+        {COMMON_ENDPOINTS.map(ep => {
+          const supported = endpoints.includes(ep);
+          const testResult = testResults[ep];
+          const isTesting = testingEndpoint === ep;
+          const epInfo = ENDPOINT_LABELS[ep];
+
+          return (
+            <button
+              key={ep}
+              type="button"
+              onClick={() => onToggleEndpoint(ep)}
+              onContextMenu={(e) => { e.preventDefault(); handleTest(ep); }}
+              disabled={isTesting}
+              className={`relative px-1.5 py-0.5 text-[9px] font-medium rounded transition-all ${
+                supported
+                  ? epInfo.color
+                  : 'bg-gray-200 dark:bg-gray-600 text-gray-400 dark:text-gray-500 hover:bg-gray-300 dark:hover:bg-gray-500'
+              }`}
+              title={`${epInfo.label}${supported ? ' ✓' : ''}${testResult ? ` (${testResult.latency_ms}ms)` : ''} | 右键测试`}
+            >
+              {isTesting ? '...' : epInfo.shortLabel}
+              {testResult?.success && (
+                <span className="absolute -top-0.5 -right-0.5 w-1.5 h-1.5 bg-green-500 rounded-full" />
+              )}
+              {testResult && !testResult.success && (
+                <span className="absolute -top-0.5 -right-0.5 w-1.5 h-1.5 bg-red-500 rounded-full" />
+              )}
+            </button>
+          );
+        })}
+      </div>
+
+      {/* 第三行：RPM + 价格 */}
+      <div className="flex items-center gap-4">
+        <div className="flex items-center gap-1">
+          <span className="text-[10px] text-gray-400">RPM:</span>
+          <input
+            type="number"
+            value={model.rpm || ''}
+            onChange={(e) => onUpdateRpm(e.target.value ? parseInt(e.target.value) : undefined)}
+            placeholder="-"
+            className="w-14 px-1.5 py-0.5 text-xs text-center bg-white dark:bg-gray-600 border border-gray-200 dark:border-gray-500 rounded"
+          />
+        </div>
+        {enableCost && (
+          <div className="flex items-center gap-1">
+            <span className="text-[10px] text-gray-400">$/1M:</span>
+            <input
+              type="number"
+              step="0.01"
+              value={model.pricing?.input || ''}
+              onChange={(e) => onUpdatePricing('input', e.target.value)}
+              placeholder="in"
+              className="w-12 px-1 py-0.5 text-xs text-center bg-white dark:bg-gray-600 border border-gray-200 dark:border-gray-500 rounded"
+            />
+            <span className="text-gray-300 dark:text-gray-500">/</span>
+            <input
+              type="number"
+              step="0.01"
+              value={model.pricing?.output || ''}
+              onChange={(e) => onUpdatePricing('output', e.target.value)}
+              placeholder="out"
+              className="w-12 px-1 py-0.5 text-xs text-center bg-white dark:bg-gray-600 border border-gray-200 dark:border-gray-500 rounded"
+            />
+          </div>
+        )}
+      </div>
     </div>
   );
 }
@@ -541,24 +803,46 @@ function ProviderModal({
     setOauthPolling(false);
   };
 
-  const addModel = () => {
-    if (newModel.trim() && !models.some(m => m.name === newModel.trim())) {
-      const modelConfig: ModelConfig = { name: newModel.trim() };
-      if (enableCost && newModelPricing.input && newModelPricing.output) {
-        modelConfig.pricing = {
-          input: parseFloat(newModelPricing.input) || 0,
-          output: parseFloat(newModelPricing.output) || 0,
-        };
-      }
-      setModels([...models, modelConfig]);
-      setNewModel('');
-      setNewModelPricing({ input: '', output: '' });
+  // 远程模型列表
+  const [remoteModels, setRemoteModels] = useState<{ id: string; name: string; owned_by?: string }[]>([]);
+  const [loadingModels, setLoadingModels] = useState(false);
+  const [showModelPicker, setShowModelPicker] = useState(false);
+  const [modelSearchQuery, setModelSearchQuery] = useState('');
+
+  // 获取 Provider 的模型列表
+  const fetchRemoteModels = async () => {
+    if (!provider?.id) {
+      setError('请先保存供应商后再获取模型列表');
+      return;
+    }
+    setLoadingModels(true);
+    setModelSearchQuery(''); // 清空搜索
+    try {
+      const models = await invoke<{ id: string; name: string; owned_by?: string }[]>('fetch_provider_models', {
+        providerId: provider.id,
+      });
+      setRemoteModels(models);
+      setShowModelPicker(true);
+    } catch (e) {
+      setError('获取模型列表失败: ' + e);
+    } finally {
+      setLoadingModels(false);
     }
   };
 
-  const removeModel = (modelName: string) => {
-    setModels(models.filter(m => m.name !== modelName));
+  // 从远程列表添加模型
+  const addModelFromRemote = (modelId: string) => {
+    if (!models.some(m => m.name === modelId)) {
+      setModels([...models, {
+        name: modelId,
+        endpoints: ['chat'],
+      }]);
+    }
   };
+
+  // 新模型的端点能力选择（用于快速添加）
+  const [newModelEndpoints, setNewModelEndpoints] = useState<EndpointCapability[]>(['chat']);
+  const [newModelRpm, setNewModelRpm] = useState('');
 
   const updateModelPricing = (modelName: string, field: 'input' | 'output', value: string) => {
     setModels(models.map(m => {
@@ -570,6 +854,21 @@ function ProviderModal({
             [field]: parseFloat(value) || 0,
           }
         };
+      }
+      return m;
+    }));
+  };
+
+  // 切换模型的端点能力
+  const toggleModelEndpoint = (modelName: string, endpoint: EndpointCapability) => {
+    setModels(models.map(m => {
+      if (m.name === modelName) {
+        const endpoints = m.endpoints || ['chat'];
+        const hasIt = endpoints.includes(endpoint);
+        const newEndpoints = hasIt
+          ? endpoints.filter(e => e !== endpoint)
+          : [...endpoints, endpoint];
+        return { ...m, endpoints: newEndpoints.length > 0 ? newEndpoints : ['chat'] };
       }
       return m;
     }));
@@ -621,14 +920,14 @@ function ProviderModal({
         await invoke('create_provider', {
           name: name.trim(),
           prefix: prefix.toLowerCase(),
-          base_url: baseUrl.trim(),
-          api_key: isOAuth ? null : apiKey.trim(),
-          models: models.length > 0 ? models.map(m => m.name) : null,
-          auth_type: isOAuth ? 'oauth' : 'api_key',
+          baseUrl: baseUrl.trim(),
+          apiKey: isOAuth ? null : apiKey.trim(),
+          models: models.length > 0 ? models : null,
+          authType: isOAuth ? 'oauth' : 'api_key',
           oauth: isOAuth ? provider?.oauth : null,
           headers: provider?.headers || null,
-          auth_header: provider?.auth_header || null,
-          auth_prefix: provider?.auth_prefix || null,
+          authHeader: provider?.auth_header || null,
+          authPrefix: provider?.auth_prefix || null,
         });
       }
       onClose();
@@ -641,7 +940,7 @@ function ProviderModal({
 
   return (
     <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4" onClick={(e) => e.target === e.currentTarget && onClose()}>
-      <div className="bg-white dark:bg-gray-800 rounded-xl shadow-2xl w-full max-w-md overflow-hidden max-h-[90vh] overflow-y-auto">
+      <div className="bg-white dark:bg-gray-800 rounded-xl shadow-2xl w-full max-w-4xl overflow-hidden max-h-[90vh] overflow-y-auto">
         <div className="px-6 py-4 border-b border-gray-200 dark:border-gray-700">
           <h3 className="text-lg font-semibold text-gray-900 dark:text-white">
             {isEdit ? '编辑供应商' : '添加供应商'}
@@ -774,98 +1073,91 @@ function ProviderModal({
 
           {/* 模型列表 */}
           <div>
-            <label className="label-base">支持的模型</label>
-            <div className="space-y-2">
-              {/* 添加新模型 */}
-              <div className="flex flex-col gap-2 p-3 bg-gray-50 dark:bg-gray-700/50 rounded-lg">
-                <div className="flex gap-2">
-                  <input
-                    type="text"
-                    value={newModel}
-                    onChange={(e) => setNewModel(e.target.value)}
-                    onKeyDown={(e) => e.key === 'Enter' && (e.preventDefault(), addModel())}
-                    placeholder="模型名，如 deepseek-chat"
-                    className="input-base font-mono text-sm flex-1"
-                  />
+            <div className="flex items-center justify-between mb-2">
+              <label className="label-base">支持的模型</label>
+              <div className="flex items-center gap-2">
+                {/* 从远程获取按钮（编辑模式） */}
+                {isEdit && (
                   <button
                     type="button"
-                    onClick={addModel}
-                    className="px-3 py-2 bg-indigo-500 text-white rounded-md hover:bg-indigo-600 text-sm"
+                    onClick={fetchRemoteModels}
+                    disabled={loadingModels}
+                    className="text-sm text-cyan-600 hover:text-cyan-800 dark:text-cyan-400 font-medium disabled:opacity-50"
                   >
-                    添加
+                    {loadingModels ? '获取中...' : '从远程获取'}
                   </button>
-                </div>
-                {enableCost && (
-                  <div className="flex gap-2 text-xs">
-                    <div className="flex-1">
-                      <label className="text-gray-500 dark:text-gray-400">输入 $/1M</label>
-                      <input
-                        type="number"
-                        step="0.01"
-                        value={newModelPricing.input}
-                        onChange={(e) => setNewModelPricing({ ...newModelPricing, input: e.target.value })}
-                        placeholder="0.00"
-                        className="w-full px-2 py-1 bg-white dark:bg-gray-600 border border-gray-200 dark:border-gray-500 rounded text-sm"
-                      />
-                    </div>
-                    <div className="flex-1">
-                      <label className="text-gray-500 dark:text-gray-400">输出 $/1M</label>
-                      <input
-                        type="number"
-                        step="0.01"
-                        value={newModelPricing.output}
-                        onChange={(e) => setNewModelPricing({ ...newModelPricing, output: e.target.value })}
-                        placeholder="0.00"
-                        className="w-full px-2 py-1 bg-white dark:bg-gray-600 border border-gray-200 dark:border-gray-500 rounded text-sm"
-                      />
-                    </div>
-                  </div>
                 )}
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (newModel.trim() && !models.some(m => m.name === newModel.trim())) {
+                      setModels([...models, {
+                        name: newModel.trim(),
+                        endpoints: ['chat'],
+                        pricing: enableCost && newModelPricing.input ? {
+                          input: parseFloat(newModelPricing.input) || 0,
+                          output: parseFloat(newModelPricing.output) || 0,
+                        } : undefined,
+                        rpm: newModelRpm ? parseInt(newModelRpm) : undefined,
+                      }]);
+                      setNewModel('');
+                      setNewModelPricing({ input: '', output: '' });
+                      setNewModelRpm('');
+                      setNewModelEndpoints(['chat']);
+                    } else if (!newModel.trim()) {
+                      setError('请输入模型名称');
+                    } else {
+                      setError('模型已存在');
+                    }
+                  }}
+                  className="text-sm text-indigo-600 hover:text-indigo-800 dark:text-indigo-400 font-medium"
+                >
+                  + 手动添加
+                </button>
               </div>
-
-              {/* 已添加的模型列表 */}
-              {models.length > 0 && (
-                <div className="space-y-1.5">
-                  {models.map((m) => (
-                    <div key={m.name} className="flex items-center gap-2 p-2 bg-gray-50 dark:bg-gray-700/30 rounded-lg">
-                      <span className="font-mono text-sm text-gray-900 dark:text-white flex-1">{m.name}</span>
-                      {enableCost && (
-                        <div className="flex gap-1.5 items-center">
-                          <input
-                            type="number"
-                            step="0.01"
-                            value={m.pricing?.input || ''}
-                            onChange={(e) => updateModelPricing(m.name, 'input', e.target.value)}
-                            placeholder="输入"
-                            className="w-16 px-1.5 py-0.5 text-xs bg-white dark:bg-gray-600 border border-gray-200 dark:border-gray-500 rounded"
-                          />
-                          <span className="text-gray-400">/</span>
-                          <input
-                            type="number"
-                            step="0.01"
-                            value={m.pricing?.output || ''}
-                            onChange={(e) => updateModelPricing(m.name, 'output', e.target.value)}
-                            placeholder="输出"
-                            className="w-16 px-1.5 py-0.5 text-xs bg-white dark:bg-gray-600 border border-gray-200 dark:border-gray-500 rounded"
-                          />
-                          <span className="text-[10px] text-gray-400">$/1M</span>
-                        </div>
-                      )}
-                      <button
-                        type="button"
-                        onClick={() => removeModel(m.name)}
-                        className="text-red-400 hover:text-red-600 text-lg leading-none"
-                      >
-                        ×
-                      </button>
-                    </div>
-                  ))}
-                </div>
-              )}
-              {models.length === 0 && (
-                <p className="text-xs text-gray-400 italic text-center py-2">未配置模型（将显示为"所有模型"）</p>
-              )}
             </div>
+
+            {/* 快速添加（手动输入） */}
+            <div className="flex gap-2 mb-3">
+              <input
+                type="text"
+                value={newModel}
+                onChange={(e) => { setNewModel(e.target.value); setError(null); }}
+                onKeyDown={(e) => e.key === 'Enter' && (e.preventDefault(), setModels([...models, {
+                  name: newModel.trim(),
+                  endpoints: newModelEndpoints,
+                  pricing: enableCost && newModelPricing.input ? {
+                    input: parseFloat(newModelPricing.input) || 0,
+                    output: parseFloat(newModelPricing.output) || 0,
+                  } : undefined,
+                  rpm: newModelRpm ? parseInt(newModelRpm) : undefined,
+                }]))}
+                placeholder="输入模型名后点击添加"
+                className="input-base font-mono text-sm flex-1"
+              />
+            </div>
+
+            {/* 模型卡片列表 */}
+            {models.length > 0 ? (
+              <div className="space-y-2">
+                {models.map((m) => (
+                  <ModelCard
+                    key={m.name}
+                    model={m}
+                    enableCost={enableCost}
+                    providerId={provider?.id || ''}
+                    onToggleEndpoint={(ep) => toggleModelEndpoint(m.name, ep)}
+                    onUpdateRpm={(rpm) => setModels(models.map(x => x.name === m.name ? { ...x, rpm } : x))}
+                    onUpdatePricing={(field, val) => updateModelPricing(m.name, field, val)}
+                    onRemove={() => setModels(models.filter(x => x.name !== m.name))}
+                  />
+                ))}
+              </div>
+            ) : (
+              <div className="text-sm text-gray-400 dark:text-gray-500 text-center py-6 bg-gray-50 dark:bg-gray-700/30 rounded-lg border-2 border-dashed border-gray-200 dark:border-gray-600">
+                暂无模型配置
+              </div>
+            )}
           </div>
 
           <label className="flex items-center gap-2 cursor-pointer">
@@ -879,8 +1171,11 @@ function ProviderModal({
           </label>
 
           {error && (
-            <div className="bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-lg p-3 text-sm text-red-700 dark:text-red-300">
-              {error}
+            <div className="bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-lg p-3 flex items-start gap-2">
+              <svg className="w-5 h-5 text-red-500 dark:text-red-400 shrink-0 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+              </svg>
+              <span className="text-sm text-red-700 dark:text-red-300">{error}</span>
             </div>
           )}
         </div>
@@ -892,6 +1187,99 @@ function ProviderModal({
           </button>
         </div>
       </div>
+
+      {/* 模型选择弹窗 */}
+      {showModelPicker && (
+        <div
+          className="fixed inset-0 bg-black/30 flex items-center justify-center z-[60] p-4"
+          onClick={() => setShowModelPicker(false)}
+        >
+          <div
+            className="bg-white dark:bg-gray-800 rounded-xl shadow-2xl w-full max-w-2xl max-h-[70vh] overflow-hidden flex flex-col"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="px-4 py-3 border-b border-gray-200 dark:border-gray-700 flex items-center justify-between shrink-0">
+              <h4 className="font-medium text-gray-900 dark:text-white">
+                选择模型
+                {remoteModels.length > 0 && (
+                  <span className="ml-2 text-xs text-gray-400">({remoteModels.length} 个)</span>
+                )}
+              </h4>
+              <button
+                onClick={() => setShowModelPicker(false)}
+                className="text-gray-400 hover:text-gray-600 dark:hover:text-gray-200"
+              >
+                <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                </svg>
+              </button>
+            </div>
+
+            {/* 搜索框 */}
+            <div className="px-4 py-2 border-b border-gray-200 dark:border-gray-700 shrink-0">
+              <input
+                type="text"
+                value={modelSearchQuery}
+                onChange={(e) => setModelSearchQuery(e.target.value)}
+                placeholder="搜索模型..."
+                className="w-full px-3 py-2 text-sm bg-gray-50 dark:bg-gray-700 border border-gray-200 dark:border-gray-600 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+                autoFocus
+              />
+            </div>
+
+            {/* 模型列表 */}
+            <div className="overflow-y-auto flex-1">
+              {(() => {
+                const query = modelSearchQuery.toLowerCase().trim();
+                const filtered = query
+                  ? remoteModels.filter(m =>
+                      m.id.toLowerCase().includes(query) ||
+                      m.owned_by?.toLowerCase().includes(query)
+                    )
+                  : remoteModels;
+
+                if (filtered.length === 0) {
+                  return (
+                    <div className="p-8 text-center text-gray-500 dark:text-gray-400">
+                      {query ? `未找到匹配 "${modelSearchQuery}" 的模型` : '未找到可用模型'}
+                    </div>
+                  );
+                }
+
+                return (
+                  <div className="divide-y divide-gray-100 dark:divide-gray-700">
+                    {filtered.map((m) => {
+                      const alreadyAdded = models.some(x => x.name === m.id);
+                      return (
+                        <button
+                          key={m.id}
+                          onClick={() => {
+                            if (!alreadyAdded) {
+                              addModelFromRemote(m.id);
+                            }
+                          }}
+                          disabled={alreadyAdded}
+                          className={`w-full px-4 py-3 text-left hover:bg-gray-50 dark:hover:bg-gray-700/50 transition-colors ${
+                            alreadyAdded ? 'opacity-50 cursor-not-allowed' : ''
+                          }`}
+                        >
+                          <div className="font-mono text-sm text-gray-900 dark:text-white">{m.id}</div>
+                          {m.owned_by && (
+                            <div className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">{m.owned_by}</div>
+                          )}
+                          {alreadyAdded && (
+                            <span className="text-xs text-green-600 dark:text-green-400">已添加</span>
+                          )}
+                        </button>
+                      );
+                    })}
+                  </div>
+                );
+              })()}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
