@@ -7,6 +7,7 @@
 
 pub mod client_config;
 pub mod commands;
+pub mod error;
 pub mod models;
 pub mod oauth;
 pub mod pricing;

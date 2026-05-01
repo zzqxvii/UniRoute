@@ -1,7 +1,7 @@
 # UniRoute 优化计划
 
 > 基于对目录下全部项目的分析，提炼可借鉴的功能与最佳实践，为 UniRoute 制定优化路线。
-> 最后更新: 2026-04-05
+> 最后更新: 2026-05-01
 
 ## 项目组合总览
 
@@ -233,6 +233,110 @@
 | P3 | 语义缓存 | ⏳ 待做 | 2-3 天 | 🔵 开发者体验 |
 | P4 | 测试覆盖 | ⏳ 待做 | 3-5 天 | ⚪ 工程质量 |
 | P4 | 国际化 + 性能优化 | ⏳ 待做 | 2-3 天 | ⚪ 工程质量 |
+
+---
+
+## ✅ 代码质量优化（参考 adk-rust） — 2026-05-01 完成
+
+### 清理死代码 ✅
+- 删除 `router/combo.rs`（引用不存在的类型）
+- 删除 `translator/claude.rs`、`translator/openai.rs`（签名与 trait 不匹配）
+- 删除 `router/fallback.rs`（未使用的 FallbackManager）
+
+### 消除重复代码 ✅
+- `build_api_url`：commands 和 router 各一份 → 统一为 `router::build_api_url`
+- `infer_provider_for_diagnosis` → 统一为 `Router::infer_provider`
+- `responses_to_chat_response`：handler 和 router 各一份 → 统一到 `router/conversion.rs`
+
+### 统一错误处理 ✅
+- 新增 `error.rs`：`AppError` 枚举（Provider/Translation/Routing/Storage/Config/RateLimited/CircuitBreakerOpen/QuotaExceeded）
+- `state/mod.rs` 的 `Result<(), String>` 统一改为 `anyhow::Result<()>`
+- Tauri 命令边界统一 `.map_err(|e| e.to_string())`
+- `handler.rs` 中错误处理路径的 `.unwrap()` 替换为 `.unwrap_or_else`
+
+### 拆分大文件 ✅
+| 模块 | 拆分前 | 拆分后 | 最大文件 |
+|------|--------|--------|---------|
+| proxy/handler | 2217 行 | 5 文件 | responses.rs 1066 行 |
+| router | 2146 行 | 5 文件 | mod.rs 1561 行 |
+| models | 1282 行 | 5 文件 | entities.rs 805 行 |
+| commands | 1677 行 | 8 文件 | proxy.rs 644 行 |
+
+### SSE 解析安全加固 ✅
+- 缓冲区大小限制（1MB）— 防止内存耗尽
+- 事件大小限制（64KB）— 跳过超大事件
+- 超时保护（60s）— 防止连接悬挂
+
+### 增强重试机制 ✅
+- 新增 `RetryConfig` 结构体（max_retries, initial_delay, max_delay, backoff_multiplier）
+- 三级延迟优先级：retry-after 头 → 熔断器 cooldown → 指数退避 + jitter
+- 可重试状态码：408, 429, 500, 502, 503, 504, 529
+- `execute_with_provider` 和 `execute_raw_request` 均集成重试逻辑
+- 新增 7 个单元测试
+
+### 验证结果
+- `cargo check`：零错误
+- `cargo test`：49 测试全部通过
+- `cargo clippy`：38 警告 → 自动修复 34 个，剩余 7 个为风格建议
+
+---
+
+## ✅ 稳定性与性能优化 — 2026-05-01 完成
+
+### 修复 RateLimiter/CircuitBreaker 状态失效 ✅ (P0 功能性 bug)
+- **问题**：`Router::new()` 每次请求创建全新的 `RateLimiter` 和 `CircuitBreaker`，导致限流/熔断状态跨请求丢失
+- **修复**：将 `RateLimiter` 和 `CircuitBreaker` 提升到 `AppState` 级别（`Arc` 包装），`Router` 构造时从 `AppState` 克隆 `Arc` 引用
+- **涉及文件**：`state/mod.rs`、`router/mod.rs`
+
+### 修复 Header 解析 panic 风险 ✅ (P0)
+- **问题**：多处对用户可控的 header 值调用 `.parse().unwrap()`，非法字符会 panic
+- **修复**：改用 `if let (Ok(k), Ok(v))` 模式匹配，`Content-Type` 改用 `HeaderValue::from_static`
+- **涉及文件**：`router/mod.rs`（3处）、`commands/proxy.rs`（3处）
+
+### 数据库 Mutex 改用 parking_lot ✅ (P1)
+- **问题**：`std::sync::Mutex` 在 tokio 异步运行时中阻塞 worker 线程，且锁中毒会导致连锁 panic
+- **修复**：替换为 `parking_lot::Mutex`（不会中毒，API 更简洁），移除所有 `.lock().unwrap()`
+- **涉及文件**：`storage/mod.rs`（28 处）
+
+### 提取公共成本计算函数 ✅ (P2)
+- **问题**：成本计算逻辑在 `chat.rs`（流式+非流式）和 `claude.rs` 中重复 3 次
+- **修复**：提取 `calculate_request_cost()` 到 `common.rs`，统一 provider 定价 → 全局定价的查找链
+- **涉及文件**：`proxy/handler/common.rs`、`chat.rs`、`claude.rs`
+
+### SSE buffer 堆分配优化 ✅ (P2)
+- **问题**：`buffer = buffer[pos..].to_string()` 每个 SSE 事件都触发堆分配
+- **修复**：改用 `buffer.drain(..pos + 2)` 原地修改
+- **涉及文件**：`proxy/handler/common.rs`、`responses.rs`（3处）
+
+### 复用共享 HTTP 客户端 ✅ (P2)
+- **问题**：`benchmark_provider`、`test_model_endpoint`、`fetch_provider_models` 每次创建新 `reqwest::Client`
+- **修复**：使用 `state.http_client` 共享客户端 + 每请求 `.timeout()` 设置
+- **涉及文件**：`commands/proxy.rs`（3处）
+
+### 删除重复 AppSettings 定义 ✅ (P2)
+- **问题**：`AppSettings` 在 `entities.rs` 和 `state/mod.rs` 中定义了两次，字段不同
+- **修复**：删除 `entities.rs` 中的死代码版本（无 `quota` 字段，未被引用）
+
+### 消除所有 clippy 警告 ✅
+- `too_many_arguments`：`create_provider`（11参数）、`set_pricing`（8参数）添加 `#[allow]`
+- `type_complexity`：提取 `OnCompleteCallback` 类型别名
+- `unnecessary_filter_map`：`filter_map` → `map`
+- `collapsible_match`：3 处添加 `#[allow]`（clippy 建议的语法无效）
+
+### 验证结果
+- `cargo check`：零错误
+- `cargo test`：49 测试全部通过
+- `cargo clippy`：零警告
+
+### 协议转换有损分析
+协议转换确实存在信息丢失，大部分是目标协议不支持的结构性差异：
+- `reasoning` input 项被丢弃（Chat API 无等价概念）
+- `refusal` 类型被跳过（客户端收到空响应而非拒绝信息）
+- 无效角色静默跳过
+- 流式响应转换未接入（功能性缺失）
+- `max_output_tokens` u64 → u32 截断
+
+建议后续：在响应中添加 `x-uniroute-warnings` header 告知客户端信息丢失。
 
 ---
 

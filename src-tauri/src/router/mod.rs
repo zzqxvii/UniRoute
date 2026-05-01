@@ -3,16 +3,18 @@
 //! 简化架构：请求模型名 → Group → 模型列表 → 选择模型 → 通过前缀找 Provider → 发送请求
 
 mod circuit_breaker;
-mod fallback;
+mod conversion;
 mod rate_limiter;
+pub mod retry;
+pub mod strategies;
 
 pub use circuit_breaker::*;
-pub use fallback::*;
+pub use conversion::*;
 pub use rate_limiter::*;
+pub use retry::RetryConfig;
 
-use crate::models::{ApiFormat, ChatRequest, EmbeddingRequest, ResponsesRequest, Group, GroupModel, GroupStrategy, ModelMapping, Provider, EndpointCapability};
+use crate::models::{ApiFormat, ChatRequest, EmbeddingRequest, ResponsesRequest, Group, GroupModel, ModelMapping, Provider, EndpointCapability};
 use crate::state::AppState;
-use rand::Rng;
 use std::sync::Arc;
 
 /// 路由信息
@@ -73,7 +75,7 @@ impl RouteResult {
 }
 
 /// 智能拼接 API URL，处理 base_url 已包含 /v1 的情况
-fn build_api_url(base_url: &str, path: &str) -> String {
+pub fn build_api_url(base_url: &str, path: &str) -> String {
     let base = base_url.trim_end_matches('/');
     // 如果 path 以 /v1 开头且 base 已包含 /v1，则去掉重复
     if base.ends_with("/v1") && path.starts_with("/v1/") {
@@ -86,16 +88,18 @@ fn build_api_url(base_url: &str, path: &str) -> String {
 /// 路由器
 pub struct Router {
     state: Arc<AppState>,
-    rate_limiter: RateLimiter,
-    circuit_breaker: CircuitBreaker,
+    rate_limiter: Arc<RateLimiter>,
+    circuit_breaker: Arc<CircuitBreaker>,
 }
 
 impl Router {
     pub fn new(state: Arc<AppState>) -> Self {
+        let rate_limiter = Arc::clone(&state.rate_limiter);
+        let circuit_breaker = Arc::clone(&state.circuit_breaker);
         Self {
             state,
-            rate_limiter: RateLimiter::new(),
-            circuit_breaker: CircuitBreaker::new(),
+            rate_limiter,
+            circuit_breaker,
         }
     }
 
@@ -453,7 +457,7 @@ impl Router {
         ).await
     }
 
-    /// 通用原始请求发送方法
+    /// 通用原始请求发送方法（带三级延迟重试）
     async fn execute_raw_request(
         &self,
         provider: &Provider,
@@ -463,6 +467,7 @@ impl Router {
         endpoint_path: &str,
         endpoint_type: &str,
     ) -> RouteResult {
+        let retry_config = RetryConfig::default();
         let circuit_key = format!("{}:{}", provider.prefix, actual_model);
 
         // 检查熔断器
@@ -512,9 +517,12 @@ impl Router {
 
         // 构建请求头
         let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert("Content-Type", "application/json".parse().unwrap());
-        if let Ok(h) = reqwest::header::HeaderName::from_bytes(provider.auth_header.as_bytes()) {
-            headers.insert(h, auth_value.parse().unwrap());
+        headers.insert(reqwest::header::CONTENT_TYPE, reqwest::header::HeaderValue::from_static("application/json"));
+        if let (Ok(h), Ok(v)) = (
+            reqwest::header::HeaderName::from_bytes(provider.auth_header.as_bytes()),
+            auth_value.parse(),
+        ) {
+            headers.insert(h, v);
         }
         for (key, value) in &provider.headers {
             if let (Ok(k), Ok(v)) = (
@@ -530,48 +538,107 @@ impl Router {
             endpoint_type, url, actual_model, provider.name
         );
 
-        let response = self.http_client()
-            .post(&url)
-            .headers(headers)
-            .json(&body)
-            .send()
-            .await;
+        let info = RouteInfo {
+            provider_name: Some(provider.name.clone()),
+            provider_prefix: Some(provider.prefix.clone()),
+            actual_model: Some(actual_model.to_string()),
+            requested_model,
+            actual_url: Some(url.clone()),
+            protocol_transform: Some("direct".to_string()),
+            endpoint_type: Some(endpoint_type.to_string()),
+        };
 
-        match response {
-            Ok(resp) => {
-                self.circuit_breaker.record_success(&circuit_key).await;
-                RouteResult {
-                    response: Some(resp),
-                    error: None,
-                    info: RouteInfo {
-                        provider_name: Some(provider.name.clone()),
-                        provider_prefix: Some(provider.prefix.clone()),
-                        actual_model: Some(actual_model.to_string()),
-                        requested_model,
-                        actual_url: Some(url),
-                        protocol_transform: Some("direct".to_string()),
-                        endpoint_type: Some(endpoint_type.to_string()),
-                    },
-                    actual_request_body: Some(body),
+        // 重试循环
+        let mut last_error: Option<String> = None;
+        for attempt in 0..=retry_config.max_retries {
+            if attempt > 0 {
+                tracing::info!(
+                    "重试 {} 请求: provider='{}', model='{}', attempt={}/{}",
+                    endpoint_type, provider.name, actual_model, attempt, retry_config.max_retries
+                );
+            }
+
+            let response = self.http_client()
+                .post(&url)
+                .headers(headers.clone())
+                .json(&body)
+                .send()
+                .await;
+
+            match response {
+                Ok(resp) => {
+                    let status = resp.status();
+
+                    if status.is_success() {
+                        self.circuit_breaker.record_success(&circuit_key).await;
+                        self.rate_limiter.clear_cooldown(&provider.id).await;
+                        return RouteResult {
+                            response: Some(resp),
+                            error: None,
+                            info,
+                            actual_request_body: Some(body),
+                        };
+                    }
+
+                    // 检查是否可重试
+                    if retry::is_retryable_status(status.as_u16()) && attempt < retry_config.max_retries {
+                        self.circuit_breaker.record_failure(&circuit_key).await;
+                        self.rate_limiter.start_cooldown(&provider.id, std::time::Duration::from_secs(30)).await;
+
+                        let retry_after = resp
+                            .headers()
+                            .get("retry-after")
+                            .and_then(|v| v.to_str().ok())
+                            .and_then(retry::parse_retry_after);
+
+                        let cooldown = self.rate_limiter.get_cooldown_remaining(&provider.id).await;
+
+                        let delay = retry::compute_retry_delay(attempt, &retry_config, retry_after, cooldown);
+                        tracing::warn!(
+                            "{} 请求返回可重试状态码 {}: 延迟 {:?} 后重试",
+                            endpoint_type, status, delay
+                        );
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+
+                    // 不可重试
+                    if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                        self.circuit_breaker.record_failure(&circuit_key).await;
+                        self.rate_limiter.start_cooldown(&provider.id, std::time::Duration::from_secs(30)).await;
+                    }
+
+                    return RouteResult {
+                        response: Some(resp),
+                        error: None,
+                        info,
+                        actual_request_body: Some(body),
+                    };
+                }
+                Err(e) => {
+                    self.circuit_breaker.record_failure(&circuit_key).await;
+                    last_error = Some(format!("请求失败: {}", e));
+                    if attempt < retry_config.max_retries {
+                        let delay = retry::compute_retry_delay(attempt, &retry_config, None, None);
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                    return RouteResult {
+                        response: None,
+                        error: last_error,
+                        info,
+                        actual_request_body: Some(body),
+                    };
                 }
             }
-            Err(e) => {
-                self.circuit_breaker.record_failure(&circuit_key).await;
-                RouteResult {
-                    response: None,
-                    error: Some(format!("请求失败: {}", e)),
-                    info: RouteInfo {
-                        provider_name: Some(provider.name.clone()),
-                        provider_prefix: Some(provider.prefix.clone()),
-                        actual_model: Some(actual_model.to_string()),
-                        requested_model,
-                        actual_url: Some(url),
-                        protocol_transform: None,
-                        endpoint_type: Some(endpoint_type.to_string()),
-                    },
-                    actual_request_body: None,
-                }
-            }
+        }
+
+        // 所有重试都失败
+        RouteResult {
+            response: None,
+            error: last_error,
+            info,
+            actual_request_body: Some(body),
         }
     }
 
@@ -599,101 +666,7 @@ impl Router {
 
     /// 根据策略选择模型
     fn select_model_by_strategy(&self, group: &Group) -> Vec<GroupModel> {
-        // 过滤掉禁用的模型
-        let models: Vec<_> = group.models.iter().filter(|m| m.enabled).cloned().collect();
-
-        if models.is_empty() {
-            return Vec::new();
-        }
-
-        match group.strategy {
-            GroupStrategy::Priority => {
-                // 按优先级排序
-                let mut sorted = models;
-                sorted.sort_by_key(|m| m.priority);
-                sorted
-            }
-            GroupStrategy::RoundRobin => {
-                // 轮询：选择下一个模型
-                let index = self.state.group_strategy_state
-                    .next_round_robin_index(&group.id, models.len());
-
-                // 返回以选定模型为首的列表（后续用于故障转移）
-                let mut result = Vec::with_capacity(models.len());
-                for i in 0..models.len() {
-                    result.push(models[(index + i) % models.len()].clone());
-                }
-                result
-            }
-            GroupStrategy::Random => {
-                // 随机选择一个模型
-                let mut rng = rand::thread_rng();
-                let index = rng.gen_range(0..models.len());
-
-                // 返回以随机模型为首的列表
-                let mut result = Vec::with_capacity(models.len());
-                for i in 0..models.len() {
-                    result.push(models[(index + i) % models.len()].clone());
-                }
-                result
-            }
-            GroupStrategy::Weighted => {
-                // 根据权重随机选择
-                let total_weight: u32 = models.iter().map(|m| m.weight).sum();
-                if total_weight == 0 {
-                    return models;
-                }
-
-                let mut rng = rand::thread_rng();
-                let mut random = rng.gen_range(0..total_weight);
-
-                let mut selected_index = 0;
-                for (i, m) in models.iter().enumerate() {
-                    if random < m.weight {
-                        selected_index = i;
-                        break;
-                    }
-                    random -= m.weight;
-                }
-
-                // 返回以选定模型为首的列表
-                let mut result = Vec::with_capacity(models.len());
-                for i in 0..models.len() {
-                    result.push(models[(selected_index + i) % models.len()].clone());
-                }
-                result
-            }
-            GroupStrategy::LeastUsed => {
-                let mut models_with_usage: Vec<_> = models
-                    .iter()
-                    .map(|m| {
-                        let usage = self.state.group_strategy_state
-                            .get_model_usage(&group.id, &m.model);
-                        (m.clone(), usage)
-                    })
-                    .collect();
-
-                models_with_usage.sort_by_key(|(_, usage)| *usage);
-
-                models_with_usage.into_iter().map(|(m, _)| m).collect()
-            }
-            GroupStrategy::CostOptimized => {
-                let pricing_manager = &self.state.pricing_manager;
-                let pm = pricing_manager.read();
-
-                let mut models_with_cost: Vec<_> = models
-                    .iter()
-                    .map(|m| {
-                        let cost = self.estimate_model_cost(&pm, &m.model);
-                        (m.clone(), cost)
-                    })
-                    .collect();
-
-                models_with_cost.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-
-                models_with_cost.into_iter().map(|(m, _)| m).collect()
-            }
-        }
+        strategies::select_model_by_strategy(self, group)
     }
 
     /// 使用 Group 执行请求
@@ -903,14 +876,19 @@ impl Router {
         });
 
         let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert("Content-Type", "application/json".parse().unwrap());
-        headers.insert(
-            reqwest::header::HeaderName::from_bytes(provider.auth_header.as_bytes()).unwrap(),
-            auth_value.parse().unwrap(),
-        );
+        headers.insert(reqwest::header::CONTENT_TYPE, reqwest::header::HeaderValue::from_static("application/json"));
+        if let (Ok(h), Ok(v)) = (
+            reqwest::header::HeaderName::from_bytes(provider.auth_header.as_bytes()),
+            auth_value.parse(),
+        ) {
+            headers.insert(h, v);
+        }
         for (key, value) in &provider.headers {
-            if let Ok(header_name) = reqwest::header::HeaderName::from_bytes(key.as_bytes()) {
-                headers.insert(header_name, value.parse().unwrap());
+            if let (Ok(k), Ok(v)) = (
+                reqwest::header::HeaderName::from_bytes(key.as_bytes()),
+                reqwest::header::HeaderValue::from_str(value),
+            ) {
+                headers.insert(k, v);
             }
         }
 
@@ -1043,7 +1021,7 @@ impl Router {
         }
     }
 
-    /// 使用 Provider 执行请求
+    /// 使用 Provider 执行请求（带三级延迟重试）
     async fn execute_with_provider(
         &self,
         provider: &Provider,
@@ -1051,6 +1029,7 @@ impl Router {
         mut request: ChatRequest,
         requested_model: String,
     ) -> RouteResult {
+        let retry_config = RetryConfig::default();
         let circuit_key = format!("{}:{}", provider.prefix, actual_model);
 
         // 检查熔断器
@@ -1115,7 +1094,7 @@ impl Router {
             provider_name: Some(provider.name.clone()),
             provider_prefix: Some(provider.prefix.clone()),
             actual_model: Some(actual_model.to_string()),
-            requested_model,
+            requested_model: requested_model.clone(),
             actual_url: Some(url.clone()),
             protocol_transform: Some("direct".to_string()),
             endpoint_type: None,
@@ -1187,60 +1166,100 @@ impl Router {
             serde_json::to_string(&body).unwrap_or_else(|_| "serialize error".to_string())
         );
 
-        // 发送请求（使用共享 HTTP 客户端）
-        let req = self.http_client().post(&url).headers(headers).json(&body);
+        // 重试循环
+        let mut last_error: Option<String> = None;
+        for attempt in 0..=retry_config.max_retries {
+            if attempt > 0 {
+                tracing::info!(
+                    "重试请求: provider='{}', model='{}', attempt={}/{}",
+                    provider.name, actual_model, attempt, retry_config.max_retries
+                );
+            }
 
-        let response = match req.send().await {
-            Ok(r) => r,
-            Err(e) => {
-                self.circuit_breaker.record_failure(&circuit_key).await;
-                self.rate_limiter.start_cooldown(&provider.id, std::time::Duration::from_secs(30)).await;
+            let req = self.http_client().post(&url).headers(headers.clone()).json(&body);
+
+            let response = match req.send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    self.circuit_breaker.record_failure(&circuit_key).await;
+                    self.rate_limiter.start_cooldown(&provider.id, std::time::Duration::from_secs(30)).await;
+                    last_error = Some(format!("请求发送失败: {}", e));
+                    // 网络错误可重试
+                    if attempt < retry_config.max_retries {
+                        let delay = retry::compute_retry_delay(attempt, &retry_config, None, None);
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                    return RouteResult {
+                        response: None,
+                        error: last_error,
+                        info,
+                        actual_request_body: Some(body),
+                    };
+                }
+            };
+
+            let status = response.status();
+
+            if status.is_success() {
+                self.circuit_breaker.record_success(&circuit_key).await;
+                self.rate_limiter.clear_cooldown(&provider.id).await;
                 return RouteResult {
-                    response: None,
-                    error: Some(format!("请求发送失败: {}", e)),
+                    response: Some(response),
+                    error: None,
                     info,
                     actual_request_body: Some(body),
                 };
             }
-        };
 
-        // 检查响应状态码
-        let status = response.status();
-        if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            self.circuit_breaker.record_failure(&circuit_key).await;
-            self.rate_limiter.start_cooldown(&provider.id, std::time::Duration::from_secs(30)).await;
-        } else if status.is_success() {
-            self.circuit_breaker.record_success(&circuit_key).await;
-            self.rate_limiter.clear_cooldown(&provider.id).await;
+            // 检查是否可重试
+            if retry::is_retryable_status(status.as_u16()) && attempt < retry_config.max_retries {
+                self.circuit_breaker.record_failure(&circuit_key).await;
+                self.rate_limiter.start_cooldown(&provider.id, std::time::Duration::from_secs(30)).await;
+
+                // 三级延迟：retry-after > 熔断器冷却 > 指数退避
+                let retry_after = response
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(retry::parse_retry_after);
+
+                let cooldown = self.rate_limiter.get_cooldown_remaining(&provider.id).await;
+
+                let delay = retry::compute_retry_delay(attempt, &retry_config, retry_after, cooldown);
+                tracing::warn!(
+                    "请求返回可重试状态码 {}: 延迟 {:?} 后重试 (attempt={}/{})",
+                    status, delay, attempt, retry_config.max_retries
+                );
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+
+            // 不可重试的状态码
+            if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                self.circuit_breaker.record_failure(&circuit_key).await;
+                self.rate_limiter.start_cooldown(&provider.id, std::time::Duration::from_secs(30)).await;
+            }
+
+            return RouteResult {
+                response: Some(response),
+                error: None,
+                info,
+                actual_request_body: Some(body),
+            };
         }
 
+        // 所有重试都失败
         RouteResult {
-            response: Some(response),
-            error: None,
+            response: None,
+            error: last_error,
             info,
             actual_request_body: Some(body),
         }
     }
 
-    /// 估算模型成本（每百万 token 的输入+输出平均价格）
-    fn estimate_model_cost(&self, pm: &crate::pricing::PricingManager, model_key: &str) -> f64 {
-        // 尝试从 provider 的模型列表中获取定价
-        let providers = self.state.get_providers();
-        for provider in &providers {
-            if let Some(pricing) = provider.get_model_pricing(model_key) {
-                return (pricing.input + pricing.output) / 2.0;
-            }
-            // 也尝试从全局定价中获取
-            if let Some(pricing) = pm.get_pricing(&provider.prefix, model_key) {
-                return (pricing.input + pricing.output) / 2.0;
-            }
-        }
-        // 默认返回一个高值，让有定价的模型优先
-        100.0
-    }
-
     /// 从模型名推断 Provider
-    fn infer_provider(model: &str) -> String {
+    pub fn infer_provider(model: &str) -> String {
         let model_lower = model.to_lowercase();
 
         if model_lower.starts_with("claude") || model_lower.starts_with("anthropic") {
@@ -1395,6 +1414,7 @@ mod tests {
             headers: Default::default(),
             auth_header: "Authorization".to_string(),
             auth_prefix: Some("Bearer".to_string()),
+            currency: "CNY".to_string(),
             is_active: true,
             is_builtin: false,
             created_at: now,
@@ -1411,6 +1431,7 @@ mod tests {
             models: models.iter().map(|m| GroupModel::new(m.to_string())).collect(),
             strategy,
             config: Default::default(),
+            endpoint_type: None,
             is_active: true,
             created_at: now,
             updated_at: now,
@@ -1670,476 +1691,3 @@ mod tests {
     }
 }
 
-/// 将 Responses API 请求转换为 Chat API 请求
-/// 支持：
-/// 1. 标准 Responses API 格式：{"input": ...}
-/// 2. Codex 格式（Chat API 风格）：{"messages": [...]}
-pub fn responses_to_chat_request(responses_req: &ResponsesRequest) -> ChatRequest {
-    // 首先检查是否是 Codex 格式（extra 中有 messages 字段）
-    if let Some(messages_value) = responses_req.extra.get("messages") {
-        if let Some(messages_array) = messages_value.as_array() {
-            tracing::info!("检测到 Codex 格式的 Responses 请求（使用 messages 字段）");
-            let messages: Vec<crate::models::Message> = messages_array
-                .iter()
-                .filter_map(|msg| {
-                    let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
-                    let content = msg.get("content");
-                    
-                    let msg_content = match content {
-                        Some(c) if c.is_string() => {
-                            crate::models::MessageContent::Text(c.as_str().unwrap_or("").to_string())
-                        }
-                        Some(c) if c.is_array() => {
-                            // 处理 Codex 格式的 content 数组: [{"text": "...", "type": "text"}]
-                            // 也处理 Responses API 格式: [{"type": "input_text", "text": "..."}]
-                            let parts: Vec<crate::models::ContentPart> = c
-                                .as_array()
-                                .unwrap()
-                                .iter()
-                                .filter_map(|part| {
-                                    let part_type = part.get("type").and_then(|t| t.as_str()).unwrap_or("text");
-                                    let text = part.get("text").and_then(|t| t.as_str());
-                                    
-                                    // 支持 "text"、"input_text"、"output_text" 类型
-                                    if part_type == "text" || part_type == "input_text" || part_type == "output_text" {
-                                        text.map(|t| crate::models::ContentPart {
-                                            content_type: "text".to_string(),
-                                            text: Some(t.to_string()),
-                                            image_url: None,
-                                            extra: serde_json::Map::new(),
-                                        })
-                                    } else if part_type == "image_url" {
-                                        part.get("image_url").map(|img_url| crate::models::ContentPart {
-                                            content_type: "image_url".to_string(),
-                                            text: None,
-                                            image_url: Some(crate::models::ImageUrl {
-                                                url: img_url.get("url").and_then(|u| u.as_str()).unwrap_or("").to_string(),
-                                                detail: None,
-                                            }),
-                                            extra: serde_json::Map::new(),
-                                        })
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .collect();
-                            crate::models::MessageContent::Parts(parts)
-                        }
-                        _ => crate::models::MessageContent::Text(String::new()),
-                    };
-                    
-                    Some(crate::models::Message {
-                        role: role.to_string(),
-                        content: msg_content,
-                        name: None,
-                        tool_calls: Vec::new(),
-                        tool_call_id: None,
-                    })
-                })
-                .collect();
-            
-            let tools: Vec<crate::models::Tool> = responses_req.tools.iter()
-                .filter(|t| t.tool_type == "function" || t.function.is_some())
-                .map(|t| {
-                    let normalized = t.normalize();
-                    tracing::debug!(
-                        "Tool normalize: before tool_type={}, function={:?}, after tool_type={}, function={:?}",
-                        t.tool_type, t.function, normalized.tool_type, normalized.function
-                    );
-                    normalized
-                })
-                .collect();
-            
-            tracing::info!("Normalized tools count: {}, first tool: {:?}", tools.len(), tools.first());
-            
-            return ChatRequest {
-                model: responses_req.model.clone(),
-                messages,
-                stream: responses_req.stream,
-                temperature: responses_req.temperature.map(|t| t as f32),
-                top_p: responses_req.top_p.map(|t| t as f32),
-                max_tokens: responses_req.max_output_tokens.map(|t| t as u32),
-                tools,
-                tool_choice: responses_req.tool_choice.clone(),
-                parallel_tool_calls: responses_req.parallel_tool_calls,
-                response_format: responses_req.response_format.clone(),
-                user: responses_req.user.clone(),
-                n: None,
-                stop: None,
-                presence_penalty: None,
-                frequency_penalty: None,
-                logit_bias: None,
-                seed: None,
-                logprobs: None,
-                top_logprobs: None,
-                extra: responses_req.extra.clone(),
-            };
-        }
-    }
-    
-    // 标准 Responses API 格式
-    let messages = match &responses_req.input {
-        Some(crate::models::ResponsesInput::Text(text)) => {
-            vec![crate::models::Message {
-                role: "user".to_string(),
-                content: crate::models::MessageContent::Text(text.clone()),
-                name: None,
-                tool_calls: Vec::new(),
-                tool_call_id: None,
-            }]
-        }
-        Some(crate::models::ResponsesInput::Items(items)) => {
-            let mut messages: Vec<crate::models::Message> = Vec::new();
-            
-            for item in items {
-                match item.item_type.as_str() {
-                    "message" => {
-                        // 获取角色，处理特殊角色映射
-                        let role = item.role.clone().unwrap_or_else(|| "user".to_string());
-                        
-                        // 将 developer 角色映射为 system
-                        let normalized_role = match role.as_str() {
-                            "developer" => "system".to_string(),
-                            other => other.to_string(),
-                        };
-
-                        // 只处理有效的角色
-                        if normalized_role != "system" && normalized_role != "user" && normalized_role != "assistant" {
-                            tracing::debug!("跳过无效角色: {}", normalized_role);
-                            continue;
-                        }
-
-                        // 转换内容
-                        let content = match &item.content {
-                            crate::models::ResponsesContent::Text(text) => {
-                                crate::models::MessageContent::Text(text.clone())
-                            }
-                            crate::models::ResponsesContent::Parts(parts) => {
-                                let converted: Vec<crate::models::ContentPart> = parts
-                                    .iter()
-                                    .filter_map(|p| {
-                                        // 转换 Responses API 类型到标准 OpenAI 类型
-                                        let normalized_type = match p.content_type.as_str() {
-                                            "input_text" | "output_text" => "text",
-                                            "input_image" => "image_url",
-                                            "refusal" => return None, // 跳过 refusal 类型
-                                            other => other,
-                                        };
-
-                                        if normalized_type == "text" {
-                                            p.text.as_ref().map(|text_content| crate::models::ContentPart {
-                                                content_type: "text".to_string(),
-                                                text: Some(text_content.clone()),
-                                                image_url: None,
-                                                extra: serde_json::Map::new(),
-                                            })
-                                        } else if normalized_type == "image_url" {
-                                            p.image_url.as_ref().map(|img_url| crate::models::ContentPart {
-                                                content_type: "image_url".to_string(),
-                                                text: None,
-                                                image_url: Some(img_url.clone()),
-                                                extra: serde_json::Map::new(),
-                                            })
-                                        } else {
-                                            Some(crate::models::ContentPart {
-                                                content_type: normalized_type.to_string(),
-                                                text: p.text.clone(),
-                                                image_url: p.image_url.clone(),
-                                                extra: serde_json::Map::new(),
-                                            })
-                                        }
-                                    })
-                                    .collect();
-                                crate::models::MessageContent::Parts(converted)
-                            }
-                        };
-
-                        messages.push(crate::models::Message {
-                            role: normalized_role,
-                            content,
-                            name: None,
-                            tool_calls: Vec::new(),
-                            tool_call_id: None,
-                        });
-                    }
-                    "function_call" => {
-                        // function_call 转换为 assistant message 的 tool_calls
-                        let call_id = item.extra.get("call_id")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let name = item.extra.get("name")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let arguments = item.extra.get("arguments")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("{}")
-                            .to_string();
-
-                        // 检查最后一条消息是否是 assistant，如果是则追加 tool_call
-                        if let Some(last_msg) = messages.last_mut() {
-                            if last_msg.role == "assistant" {
-                                last_msg.tool_calls.push(crate::models::ToolCall {
-                                    id: call_id,
-                                    call_type: "function".to_string(),
-                                    function: crate::models::FunctionCall {
-                                        name,
-                                        arguments,
-                                    },
-                                });
-                                continue;
-                            }
-                        }
-
-                        // 否则创建新的 assistant message
-                        messages.push(crate::models::Message {
-                            role: "assistant".to_string(),
-                            content: crate::models::MessageContent::Text(String::new()),
-                            name: None,
-                            tool_calls: vec![crate::models::ToolCall {
-                                id: call_id,
-                                call_type: "function".to_string(),
-                                function: crate::models::FunctionCall {
-                                    name,
-                                    arguments,
-                                },
-                            }],
-                            tool_call_id: None,
-                        });
-                    }
-                    "function_call_output" => {
-                        // function_call_output 转换为 tool role message
-                        let call_id = item.extra.get("call_id")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let output = item.extra.get("output")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-
-                        messages.push(crate::models::Message {
-                            role: "tool".to_string(),
-                            content: crate::models::MessageContent::Text(output),
-                            name: None,
-                            tool_calls: Vec::new(),
-                            tool_call_id: Some(call_id),
-                        });
-                    }
-                    "reasoning" => {
-                        // reasoning 类型无法映射到 Chat API，记录日志后跳过
-                        tracing::debug!("跳过 reasoning 类型的 input 项");
-                    }
-                    other => {
-                        tracing::warn!("未知的 input 类型: {}", other);
-                    }
-                }
-            }
-            messages
-        }
-        Some(crate::models::ResponsesInput::Raw(value)) => {
-            // 尝试从原始值中提取信息
-            tracing::warn!("Responses API 收到未知的 input 格式，尝试转换: {:?}", value);
-            // 如果是对象，尝试提取内容作为文本
-            if let Some(text) = value.as_str() {
-                vec![crate::models::Message {
-                    role: "user".to_string(),
-                    content: crate::models::MessageContent::Text(text.to_string()),
-                    name: None,
-                    tool_calls: Vec::new(),
-                    tool_call_id: None,
-                }]
-            } else {
-                // 无法解析，使用 JSON 字符串
-                vec![crate::models::Message {
-                    role: "user".to_string(),
-                    content: crate::models::MessageContent::Text(value.to_string()),
-                    name: None,
-                    tool_calls: Vec::new(),
-                    tool_call_id: None,
-                }]
-            }
-        }
-        None => {
-            // 没有 input 字段，也没有 messages 字段，使用空消息
-            tracing::warn!("Responses API 请求没有 input 或 messages 字段");
-            vec![crate::models::Message {
-                role: "user".to_string(),
-                content: crate::models::MessageContent::Text(String::new()),
-                name: None,
-                tool_calls: Vec::new(),
-                tool_call_id: None,
-            }]
-        }
-    };
-
-    // 处理 instructions 字段：添加到 messages 开头作为 system 消息
-    let final_messages = if let Some(ref instructions) = responses_req.instructions {
-        if !instructions.is_empty() {
-            let mut msgs = Vec::with_capacity(messages.len() + 1);
-            msgs.push(crate::models::Message {
-                role: "system".to_string(),
-                content: crate::models::MessageContent::Text(instructions.clone()),
-                name: None,
-                tool_calls: Vec::new(),
-                tool_call_id: None,
-            });
-            msgs.extend(messages);
-            msgs
-        } else {
-            messages
-        }
-    } else {
-        messages
-    };
-
-    let tools: Vec<crate::models::Tool> = responses_req.tools.iter()
-        .filter(|t| t.tool_type == "function" || t.function.is_some())
-        .map(|t| t.normalize())
-        .collect();
-
-    ChatRequest {
-        model: responses_req.model.clone(),
-        messages: final_messages,
-        stream: responses_req.stream,
-        // 直接映射的参数
-        temperature: responses_req.temperature.map(|t| t as f32),
-        top_p: responses_req.top_p.map(|t| t as f32),
-        max_tokens: responses_req.max_output_tokens.map(|t| t as u32),
-        tools,
-        tool_choice: responses_req.tool_choice.clone(),
-        parallel_tool_calls: responses_req.parallel_tool_calls,
-        response_format: responses_req.response_format.clone(),
-        user: responses_req.user.clone(),
-        // Chat API 独有参数（Responses API 不支持，保持默认）
-        n: None,
-        stop: None,
-        presence_penalty: None,
-        frequency_penalty: None,
-        logit_bias: None,
-        seed: None,
-        logprobs: None,
-        top_logprobs: None,
-        // 其他未知字段
-        extra: responses_req.extra.clone(),
-    }
-}
-
-/// 将 Chat API 响应转换为 Responses API 响应
-pub fn chat_to_responses_response(chat_resp: &serde_json::Value, requested_model: &str) -> serde_json::Value {
-    // 生成 Responses API 格式的 id
-    let original_id = chat_resp.get("id").and_then(|v| v.as_str()).unwrap_or("");
-    let response_id = if original_id.starts_with("resp_") {
-        original_id.to_string()
-    } else {
-        format!("resp_{}", uuid::Uuid::new_v4().to_string().replace("-", "")[..24].to_string())
-    };
-
-    let model = chat_resp.get("model").and_then(|v| v.as_str()).unwrap_or(requested_model);
-
-    // 提取 choices
-    let choices = chat_resp.get("choices").and_then(|c| c.as_array());
-    let first_choice = choices.and_then(|arr| arr.first());
-
-    // 提取 message
-    let message = first_choice.and_then(|c| c.get("message"));
-
-    // 提取 content（可能为 null 或字符串）
-    let content_text = message
-        .and_then(|m| m.get("content"))
-        .and_then(|c| c.as_str())
-        .unwrap_or("");
-
-    // 提取 tool_calls（如果存在）
-    let tool_calls = message.and_then(|m| m.get("tool_calls")).and_then(|tc| tc.as_array());
-
-    // 提取 finish_reason
-    let finish_reason = first_choice
-        .and_then(|c| c.get("finish_reason"))
-        .and_then(|v| v.as_str());
-
-    // 确定 status
-    let status = match finish_reason {
-        Some("stop") => "completed",
-        Some("length") => "incomplete",
-        Some("tool_calls") => "completed",
-        _ => "completed",
-    };
-
-    // 构建 output 数组
-    let mut output: Vec<serde_json::Value> = Vec::new();
-
-    // 添加 message 项（如果有内容）
-    if !content_text.is_empty() {
-        output.push(serde_json::json!({
-            "type": "message",
-            "id": format!("msg_{}", uuid::Uuid::new_v4().to_string().replace("-", "")[..24].to_string()),
-            "status": "completed",
-            "role": "assistant",
-            "content": [{
-                "type": "output_text",
-                "text": content_text,
-                "annotations": []
-            }]
-        }));
-    }
-
-    // 添加 function_call 项（如果有 tool_calls）
-    if let Some(calls) = tool_calls {
-        for call in calls {
-            let call_id = call.get("id").and_then(|v| v.as_str()).unwrap_or("");
-            let function = call.get("function");
-            let name = function.and_then(|f| f.get("name")).and_then(|v| v.as_str()).unwrap_or("");
-            let arguments = function.and_then(|f| f.get("arguments")).and_then(|v| v.as_str()).unwrap_or("{}");
-
-            output.push(serde_json::json!({
-                "type": "function_call",
-                "id": format!("fc_{}", uuid::Uuid::new_v4().to_string().replace("-", "")[..24].to_string()),
-                "call_id": call_id,
-                "name": name,
-                "arguments": arguments,
-                "status": "completed"
-            }));
-        }
-    }
-
-    // 如果 output 为空，添加一个空的 message
-    if output.is_empty() {
-        output.push(serde_json::json!({
-            "type": "message",
-            "id": format!("msg_{}", uuid::Uuid::new_v4().to_string().replace("-", "")[..24].to_string()),
-            "status": "completed",
-            "role": "assistant",
-            "content": []
-        }));
-    }
-
-    // 处理 usage
-    let usage = chat_resp.get("usage").map(|u| {
-        let input_tokens = u.get("prompt_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
-        let output_tokens = u.get("completion_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
-        serde_json::json!({
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens,
-            "total_tokens": u.get("total_tokens").and_then(|v| v.as_i64())
-                .unwrap_or(input_tokens + output_tokens),
-        })
-    });
-
-    serde_json::json!({
-        "id": response_id,
-        "object": "response",
-        "created_at": chrono::Utc::now().timestamp(),
-        "status": status,
-        "error": null,
-        "incomplete_details": if status == "incomplete" {
-            serde_json::json!({"reason": "max_output_tokens"})
-        } else {
-            serde_json::Value::Null
-        },
-        "model": model,
-        "output": output,
-        "usage": usage,
-    })
-}

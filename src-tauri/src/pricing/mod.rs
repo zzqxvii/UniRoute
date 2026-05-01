@@ -140,12 +140,10 @@ impl PricingManager {
         if pattern == "*" {
             return true;
         }
-        if pattern.ends_with('*') {
-            let prefix = &pattern[..pattern.len() - 1];
+        if let Some(prefix) = pattern.strip_suffix('*') {
             return model.starts_with(prefix);
         }
-        if pattern.starts_with('*') {
-            let suffix = &pattern[1..];
+        if let Some(suffix) = pattern.strip_prefix('*') {
             return model.ends_with(suffix);
         }
         model == pattern
@@ -155,7 +153,7 @@ impl PricingManager {
     pub fn set_user_pricing(&mut self, provider: String, model: String, pricing: PricingEntry) {
         self.user_pricing
             .entry(provider)
-            .or_insert_with(HashMap::new)
+            .or_default()
             .insert(model, pricing);
     }
 
@@ -182,7 +180,7 @@ impl PricingManager {
         let mut result = self.default_pricing.clone();
 
         for (provider, models) in &self.user_pricing {
-            let entry = result.entry(provider.clone()).or_insert_with(HashMap::new);
+            let entry = result.entry(provider.clone()).or_default();
             for (model, pricing) in models {
                 entry.insert(model.clone(), pricing.clone());
             }

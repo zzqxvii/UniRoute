@@ -7,10 +7,10 @@ use crate::models::{
     RequestLog,
 };
 use anyhow::Result;
+use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Mutex;
 
 /// 请求统计
 #[derive(Debug, Clone, serde::Serialize)]
@@ -52,7 +52,7 @@ impl Database {
     }
 
     fn init_schema(&self) -> Result<()> {
-        let db = self.conn.lock().unwrap();
+        let db = self.conn.lock();
 
         db.execute_batch(
             r#"
@@ -362,7 +362,7 @@ impl Database {
     // ============ Providers ============
 
     pub fn save_provider(&self, provider: &Provider) -> Result<()> {
-        let db = self.conn.lock().unwrap();
+        let db = self.conn.lock();
         db.execute(
             r#"INSERT INTO providers (id, name, prefix, base_url, api_key, api_format, models, enable_cost, currency, auth_type, oauth_config, oauth_tokens, headers, auth_header, auth_prefix, is_active, is_builtin, created_at, updated_at)
                VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)
@@ -379,8 +379,8 @@ impl Database {
                 provider.enable_cost as i32,
                 &provider.currency,
                 serde_json::to_string(&provider.auth_type)?,
-                provider.oauth.as_ref().map(|o| serde_json::to_string(o).ok()).flatten(),
-                provider.oauth_tokens.as_ref().map(|t| serde_json::to_string(t).ok()).flatten(),
+                provider.oauth.as_ref().and_then(|o| serde_json::to_string(o).ok()),
+                provider.oauth_tokens.as_ref().and_then(|t| serde_json::to_string(t).ok()),
                 serde_json::to_string(&provider.headers)?,
                 provider.auth_header,
                 provider.auth_prefix,
@@ -394,7 +394,7 @@ impl Database {
     }
 
     pub fn load_providers(&self) -> Result<Vec<Provider>> {
-        let db = self.conn.lock().unwrap();
+        let db = self.conn.lock();
         let mut stmt = db.prepare(
             "SELECT id, name, prefix, base_url, api_key, api_format, models, enable_cost, currency, auth_type, oauth_config, oauth_tokens, headers, auth_header, auth_prefix, is_active, is_builtin, created_at, updated_at
              FROM providers ORDER BY name"
@@ -423,7 +423,7 @@ impl Database {
                             serde_json::from_str(&models_str).unwrap_or_default();
                         old_models
                             .into_iter()
-                            .map(|name| crate::models::ModelConfig::from(name))
+                            .map(crate::models::ModelConfig::from)
                             .collect()
                     };
 
@@ -475,7 +475,7 @@ impl Database {
     }
 
     pub fn get_provider_by_prefix(&self, prefix: &str) -> Result<Option<Provider>> {
-        let db = self.conn.lock().unwrap();
+        let db = self.conn.lock();
         let result = db.query_row(
             "SELECT id, name, prefix, base_url, api_key, api_format, models, enable_cost, currency, auth_type, oauth_config, oauth_tokens, headers, auth_header, auth_prefix, is_active, is_builtin, created_at, updated_at
              FROM providers WHERE prefix=?1",
@@ -498,7 +498,7 @@ impl Database {
                     serde_json::from_str(&models_str).unwrap_or_default()
                 } else {
                     let old_models: Vec<String> = serde_json::from_str(&models_str).unwrap_or_default();
-                    old_models.into_iter().map(|name| crate::models::ModelConfig::from(name)).collect()
+                    old_models.into_iter().map(crate::models::ModelConfig::from).collect()
                 };
 
                 let auth_type: AuthType = auth_type_str
@@ -544,7 +544,6 @@ impl Database {
     pub fn delete_provider(&self, id: &str) -> Result<()> {
         self.conn
             .lock()
-            .unwrap()
             .execute("DELETE FROM providers WHERE id=?1 AND is_builtin=0", [id])?;
         Ok(())
     }
@@ -552,7 +551,7 @@ impl Database {
     // ============ Groups ============
 
     pub fn save_group(&self, group: &Group) -> Result<()> {
-        let db = self.conn.lock().unwrap();
+        let db = self.conn.lock();
         db.execute(
             r#"INSERT INTO groups (id, name, description, strategy, config, is_active, created_at, updated_at, endpoint_type)
                VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
@@ -588,7 +587,7 @@ impl Database {
     }
 
     pub fn load_groups(&self) -> Result<Vec<Group>> {
-        let db = self.conn.lock().unwrap();
+        let db = self.conn.lock();
         let mut stmt = db.prepare(
             "SELECT id, name, description, strategy, config, is_active, created_at, updated_at, endpoint_type FROM groups ORDER BY name"
         )?;
@@ -635,7 +634,7 @@ impl Database {
     }
 
     pub fn delete_group(&self, id: &str) -> Result<()> {
-        let db = self.conn.lock().unwrap();
+        let db = self.conn.lock();
         db.execute("DELETE FROM group_models WHERE group_id=?1", [id])?;
         db.execute("DELETE FROM groups WHERE id=?1", [id])?;
         Ok(())
@@ -644,7 +643,7 @@ impl Database {
     // ============ Model Mappings ============
 
     pub fn save_model_mapping(&self, m: &ModelMapping) -> Result<()> {
-        let db = self.conn.lock().unwrap();
+        let db = self.conn.lock();
         db.execute(
             r#"INSERT INTO model_mappings (id, pattern, group_id, priority)
                VALUES (?1,?2,?3,?4)
@@ -655,7 +654,7 @@ impl Database {
     }
 
     pub fn load_model_mappings(&self) -> Result<Vec<ModelMapping>> {
-        let db = self.conn.lock().unwrap();
+        let db = self.conn.lock();
         let mut stmt = db.prepare(
             "SELECT id, pattern, group_id, priority FROM model_mappings ORDER BY priority",
         )?;
@@ -675,7 +674,6 @@ impl Database {
     pub fn delete_model_mapping(&self, id: &str) -> Result<()> {
         self.conn
             .lock()
-            .unwrap()
             .execute("DELETE FROM model_mappings WHERE id=?1", [id])?;
         Ok(())
     }
@@ -683,7 +681,7 @@ impl Database {
     // ============ Settings ============
 
     pub fn save_setting(&self, key: &str, value: &str) -> Result<()> {
-        self.conn.lock().unwrap().execute(
+        self.conn.lock().execute(
             "INSERT OR REPLACE INTO settings (key, value) VALUES (?1,?2)",
             [key, value],
         )?;
@@ -694,7 +692,6 @@ impl Database {
         Ok(self
             .conn
             .lock()
-            .unwrap()
             .query_row("SELECT value FROM settings WHERE key=?1", [key], |r| {
                 r.get(0)
             })
@@ -719,7 +716,7 @@ impl Database {
         let mut result = ImportResult::default();
 
         if !merge {
-            let db = self.conn.lock().unwrap();
+            let db = self.conn.lock();
             db.execute("DELETE FROM group_models", [])?;
             db.execute("DELETE FROM model_mappings", [])?;
             db.execute("DELETE FROM groups", [])?;
@@ -765,7 +762,7 @@ impl Database {
     // ============ Request Logs ============
 
     pub fn save_request_log(&self, log: &RequestLog) -> Result<i64> {
-        let db = self.conn.lock().unwrap();
+        let db = self.conn.lock();
         db.execute(
             r#"INSERT INTO request_logs
                (timestamp, method, path, requested_model, model, provider, provider_prefix, url, protocol_transform, endpoint_type, status_code, latency_ms, first_token_ms, prompt_tokens, completion_tokens, original_input_tokens, translated_input_tokens, cost, error, original_request_body, request_body, original_response_body, response_body)
@@ -800,7 +797,7 @@ impl Database {
     }
 
     pub fn load_request_logs(&self, limit: i64, offset: i64) -> Result<Vec<RequestLog>> {
-        let db = self.conn.lock().unwrap();
+        let db = self.conn.lock();
         let mut stmt = db.prepare(
             "SELECT id, timestamp, method, path, requested_model, model, provider, provider_prefix, url, protocol_transform, endpoint_type, status_code, latency_ms, first_token_ms, prompt_tokens, completion_tokens, original_input_tokens, translated_input_tokens, cost, error, original_request_body, request_body, original_response_body, response_body
              FROM request_logs ORDER BY timestamp DESC LIMIT ?1 OFFSET ?2"
@@ -840,7 +837,7 @@ impl Database {
     }
 
     pub fn count_request_logs(&self) -> Result<i64> {
-        let db = self.conn.lock().unwrap();
+        let db = self.conn.lock();
         let count: i64 = db.query_row("SELECT COUNT(*) FROM request_logs", [], |r| r.get(0))?;
         Ok(count)
     }
@@ -848,13 +845,12 @@ impl Database {
     pub fn clear_request_logs(&self) -> Result<()> {
         self.conn
             .lock()
-            .unwrap()
             .execute("DELETE FROM request_logs", [])?;
         Ok(())
     }
 
     pub fn get_stats(&self) -> Result<RequestStats> {
-        let db = self.conn.lock().unwrap();
+        let db = self.conn.lock();
         let total_requests: i64 =
             db.query_row("SELECT COUNT(*) FROM request_logs", [], |r| r.get(0))?;
         let successful_requests: i64 = db.query_row(
@@ -893,7 +889,7 @@ impl Database {
 
     /// 获取按模型分组的成本统计
     pub fn get_cost_by_model(&self, limit: i64) -> Result<Vec<CostByModel>> {
-        let db = self.conn.lock().unwrap();
+        let db = self.conn.lock();
         let mut stmt = db.prepare(
             r#"SELECT model,
                       COUNT(*) as request_count,
@@ -922,7 +918,7 @@ impl Database {
 
     /// 获取按供应商分组的成本统计
     pub fn get_cost_by_provider(&self, limit: i64) -> Result<Vec<CostByProvider>> {
-        let db = self.conn.lock().unwrap();
+        let db = self.conn.lock();
         let mut stmt = db.prepare(
             r#"SELECT provider,
                       COUNT(*) as request_count,
@@ -951,7 +947,7 @@ impl Database {
 
     /// 获取每日成本统计
     pub fn get_daily_cost(&self, days: i64) -> Result<Vec<DailyCost>> {
-        let db = self.conn.lock().unwrap();
+        let db = self.conn.lock();
         let mut stmt = db.prepare(
             r#"SELECT date(timestamp) as date,
                       COUNT(*) as request_count,
@@ -1011,7 +1007,7 @@ pub struct DailyCost {
 impl Database {
     /// 获取今日成本
     pub fn get_today_cost(&self) -> Result<f64> {
-        let db = self.conn.lock().unwrap();
+        let db = self.conn.lock();
         let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
         let cost: f64 = db.query_row(
             "SELECT COALESCE(SUM(cost), 0) FROM request_logs WHERE date(timestamp) = ?1",
@@ -1023,7 +1019,7 @@ impl Database {
 
     /// 获取本月成本
     pub fn get_month_cost(&self) -> Result<f64> {
-        let db = self.conn.lock().unwrap();
+        let db = self.conn.lock();
         let month_start = chrono::Utc::now().format("%Y-%m-01").to_string();
         let cost: f64 = db.query_row(
             "SELECT COALESCE(SUM(cost), 0) FROM request_logs WHERE date(timestamp) >= ?1",
@@ -1035,7 +1031,7 @@ impl Database {
 
     /// 获取最近24小时流量统计
     pub fn get_hourly_traffic(&self, hours: i64) -> Result<Vec<HourlyTraffic>> {
-        let db = self.conn.lock().unwrap();
+        let db = self.conn.lock();
         let mut stmt = db.prepare(
             r#"SELECT 
                 strftime('%Y-%m-%d %H:00', timestamp) as hour,
@@ -1062,7 +1058,7 @@ impl Database {
 
     /// 获取供应商健康状态
     pub fn get_provider_health(&self, hours: i64) -> Result<Vec<ProviderHealth>> {
-        let db = self.conn.lock().unwrap();
+        let db = self.conn.lock();
         let mut stmt = db.prepare(
             r#"SELECT 
                 COALESCE(provider, '未知') as provider,

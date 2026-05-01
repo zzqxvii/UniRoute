@@ -488,11 +488,10 @@ impl DefaultTranslator {
                     state.finish_reason_sent = true;
                 }
             }
-            "message_stop" => {
-                if !state.finish_reason_sent {
+            "message_stop"
+                if !state.finish_reason_sent => {
                     results.push(self.create_chunk(state, json!({}), Some("stop")));
                 }
-            }
             _ => {}
         }
 
@@ -590,9 +589,9 @@ impl DefaultTranslator {
 
         for msg in &request.messages {
             match msg.role.as_str() {
-                "system" => {
+                "system"
                     // 第一个 system 消息作为 instructions
-                    if instructions.is_none() {
+                    if instructions.is_none() => {
                         instructions = Some(match &msg.content {
                             MessageContent::Text(t) => t.clone(),
                             MessageContent::Parts(parts) => {
@@ -600,7 +599,6 @@ impl DefaultTranslator {
                             }
                         });
                     }
-                }
                 "user" => {
                     let content = self.convert_content_to_responses(&msg.content, "input_text");
                     input.push(json!({
@@ -867,9 +865,10 @@ impl DefaultTranslator {
 
         // 处理 status → finish_reason
         let status = response.get("status").and_then(|v| v.as_str()).unwrap_or("completed");
-        let finish_reason = match status {
-            "completed" => if has_tool_use { "tool_calls" } else { "stop" },
-            "incomplete" => "length",
+        let finish_reason = match (status, has_tool_use) {
+            ("completed", true) => "tool_calls",
+            ("completed", false) => "stop",
+            ("incomplete", _) => "length",
             _ => "stop",
         };
 
@@ -975,9 +974,10 @@ impl DefaultTranslator {
         }
 
         let status = response.get("status").and_then(|v| v.as_str()).unwrap_or("completed");
-        let stop_reason = match status {
-            "completed" => if has_tool_use { "tool_use" } else { "end_turn" },
-            "incomplete" => "max_tokens",
+        let stop_reason = match (status, has_tool_use) {
+            ("completed", true) => "tool_use",
+            ("completed", false) => "end_turn",
+            ("incomplete", _) => "max_tokens",
             _ => "end_turn",
         };
 

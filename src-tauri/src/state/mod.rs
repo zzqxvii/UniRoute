@@ -5,6 +5,7 @@
 use crate::models::{Group, ModelMapping, Provider, ProviderTemplate, QuotaLimit, QuotaStatus, RequestLog};
 use crate::oauth::OAuthState;
 use crate::pricing::PricingManager;
+use crate::router::{RateLimiter, CircuitBreaker};
 use crate::storage::Database;
 use anyhow::{Context, Result};
 use parking_lot::RwLock;
@@ -102,6 +103,10 @@ pub struct AppState {
     pub group_strategy_state: Arc<GroupStrategyState>,
     /// 共享 HTTP 客户端（复用连接池）
     pub http_client: reqwest::Client,
+    /// 共享速率限制器（跨请求保持状态）
+    pub rate_limiter: Arc<RateLimiter>,
+    /// 共享熔断器（跨请求保持状态）
+    pub circuit_breaker: Arc<CircuitBreaker>,
 }
 
 /// 代理服务器句柄
@@ -142,6 +147,8 @@ impl AppState {
             pricing_manager: Arc::new(RwLock::new(pricing_manager)),
             group_strategy_state: Arc::new(GroupStrategyState::new()),
             http_client: reqwest::Client::new(),
+            rate_limiter: Arc::new(RateLimiter::new()),
+            circuit_breaker: Arc::new(CircuitBreaker::new()),
         })
     }
 
@@ -267,16 +274,16 @@ impl AppState {
 
     // ============ 数据导入导出 ============
 
-    pub fn export_data(&self) -> Result<String, String> {
-        self.db.export_json().map_err(|e| e.to_string())
+    pub fn export_data(&self) -> anyhow::Result<String> {
+        self.db.export_json()
     }
 
-    pub fn import_data(&self, json: &str, merge: bool) -> Result<crate::storage::ImportResult, String> {
-        let result = self.db.import_json(json, merge).map_err(|e| e.to_string())?;
+    pub fn import_data(&self, json: &str, merge: bool) -> anyhow::Result<crate::storage::ImportResult> {
+        let result = self.db.import_json(json, merge)?;
         // 刷新内存
-        let providers = self.db.load_providers().map_err(|e| e.to_string())?;
-        let groups = self.db.load_groups().map_err(|e| e.to_string())?;
-        let mappings = self.db.load_model_mappings().map_err(|e| e.to_string())?;
+        let providers = self.db.load_providers()?;
+        let groups = self.db.load_groups()?;
+        let mappings = self.db.load_model_mappings()?;
         *self.providers.write() = providers;
         *self.groups.write() = groups;
         *self.model_mappings.write() = mappings;
@@ -300,7 +307,7 @@ impl AppState {
     }
 
     pub fn get_request_stats(&self) -> crate::storage::RequestStats {
-        self.db.get_stats().unwrap_or_else(|_| crate::storage::RequestStats {
+        self.db.get_stats().unwrap_or(crate::storage::RequestStats {
             total_requests: 0,
             successful_requests: 0,
             failed_requests: 0,
@@ -310,8 +317,8 @@ impl AppState {
         })
     }
 
-    pub fn clear_request_logs(&self) -> Result<(), String> {
-        self.db.clear_request_logs().map_err(|e| e.to_string())
+    pub fn clear_request_logs(&self) -> anyhow::Result<()> {
+        self.db.clear_request_logs()
     }
 
     // ============ 定价管理 ============
@@ -327,19 +334,19 @@ impl AppState {
     }
 
     /// 设置用户定价
-    pub fn set_pricing(&self, provider: String, model: String, pricing: crate::pricing::PricingEntry) -> Result<(), String> {
+    pub fn set_pricing(&self, provider: String, model: String, pricing: crate::pricing::PricingEntry) -> anyhow::Result<()> {
         self.pricing_manager.write().set_user_pricing(provider, model, pricing);
         self.save_user_pricing()
     }
 
     /// 删除用户定价
-    pub fn delete_pricing(&self, provider: Option<&str>, model: Option<&str>) -> Result<(), String> {
+    pub fn delete_pricing(&self, provider: Option<&str>, model: Option<&str>) -> anyhow::Result<()> {
         self.pricing_manager.write().clear_user_pricing(provider, model);
         self.save_user_pricing()
     }
 
     /// 重置用户定价
-    pub fn reset_pricing(&self) -> Result<(), String> {
+    pub fn reset_pricing(&self) -> anyhow::Result<()> {
         self.pricing_manager.write().clear_user_pricing(None, None);
         self.save_user_pricing()
     }
@@ -352,10 +359,10 @@ impl AppState {
     }
 
     /// 更新配额限制配置
-    pub fn update_quota_limit(&self, quota: QuotaLimit) -> Result<(), String> {
+    pub fn update_quota_limit(&self, quota: QuotaLimit) -> anyhow::Result<()> {
         let mut settings = self.settings.write();
         settings.quota = quota;
-        let _ = self.db.save_setting("settings", &serde_json::to_string(&*settings).unwrap());
+        self.db.save_setting("settings", &serde_json::to_string(&*settings)?)?;
         Ok(())
     }
 
@@ -374,10 +381,10 @@ impl AppState {
     }
 
     /// 保存用户定价到数据库
-    fn save_user_pricing(&self) -> Result<(), String> {
+    fn save_user_pricing(&self) -> anyhow::Result<()> {
         let json = self.pricing_manager.read().export_user_pricing();
-        self.db.save_setting("user_pricing", &json)
-            .map_err(|e| e.to_string())
+        self.db.save_setting("user_pricing", &json)?;
+        Ok(())
     }
 }
 

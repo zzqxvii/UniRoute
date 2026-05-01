@@ -85,6 +85,21 @@ impl RateLimiter {
             state.cooldown_until = None;
         }
     }
+
+    /// Get remaining cooldown duration for a connection
+    pub async fn get_cooldown_remaining(&self, connection_id: &str) -> Option<Duration> {
+        let limits = self.limits.read().await;
+        limits.get(connection_id).and_then(|state| {
+            state.cooldown_until.map(|until| {
+                let now = Instant::now();
+                if until > now {
+                    until - now
+                } else {
+                    Duration::ZERO
+                }
+            })
+        })
+    }
 }
 
 impl Default for RateLimiter {

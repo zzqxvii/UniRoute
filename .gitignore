@@ -83,3 +83,19 @@ coverage/
 *.swp
 *.swo
 *~
+
+# ── OMC (oh-my-claudecode) ──
+.omc/
+
+# ── GSD baseline (auto-generated) ──
+.gsd
+.gsd-id
+.mcp.json
+.bg-shell/
+*.code-workspace
+__pycache__/
+*.pyc
+.venv/
+venv/
+vendor/
+tmp/
