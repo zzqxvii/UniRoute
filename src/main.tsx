@@ -1,29 +1,17 @@
-import React, { useEffect } from 'react';
+import React from 'react';
 import ReactDOM from 'react-dom/client';
 import { BrowserRouter } from 'react-router-dom';
+import { ProxyProvider } from './components/ProxyContext';
 import App from './App';
 import './index.css';
 import './i18n';
 
-function HideLoadingScreen() {
-  useEffect(() => {
-    const hide = () => {
-      const el = document.getElementById('loading-screen');
-      if (el) {
-        el.classList.add('hidden');
-        setTimeout(() => el.remove(), 300);
-      }
-    };
-    hide();
-  }, []);
-  return null;
-}
-
 ReactDOM.createRoot(document.getElementById('root') as HTMLElement).render(
   <React.StrictMode>
     <BrowserRouter>
-      <HideLoadingScreen />
-      <App />
+      <ProxyProvider>
+        <App />
+      </ProxyProvider>
     </BrowserRouter>
   </React.StrictMode>
 );

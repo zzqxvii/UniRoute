@@ -1,5 +1,6 @@
 import { useState, useEffect, useMemo } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { useProxy } from '../components/ProxyContext';
 
 // 端点类型定义
 interface EndpointInfo {
@@ -61,25 +62,15 @@ interface Provider {
   is_active: boolean;
 }
 
-interface ProxyStatus {
-  is_running: boolean;
-  port: number | null;
-}
-
-interface AppSettings {
-  proxy_port: number;
-}
-
 type ConfigType = 'claude' | 'codex' | 'opencode' | 'cursor' | 'custom';
 
 function Groups() {
+  const { proxyStatus, settings } = useProxy();
   const [groups, setGroups] = useState<Group[]>([]);
   const [providers, setProviders] = useState<Provider[]>([]);
   const [selectedEndpoint, setSelectedEndpoint] = useState<string>('chat');
   const [showModal, setShowModal] = useState(false);
   const [editingGroup, setEditingGroup] = useState<Group | null>(null);
-  const [proxyStatus, setProxyStatus] = useState<ProxyStatus>({ is_running: false, port: null });
-  const [settings, setSettings] = useState<AppSettings | null>(null);
   const [showConfigModal, setShowConfigModal] = useState(false);
   const [selectedGroup, setSelectedGroup] = useState<Group | null>(null);
   const [configType, setConfigType] = useState<ConfigType>('claude');
@@ -95,16 +86,12 @@ function Groups() {
 
   const loadData = async () => {
     try {
-      const [groupsResult, providersResult, status, settingsResult] = await Promise.all([
+      const [groupsResult, providersResult] = await Promise.all([
         invoke<Group[]>('get_groups'),
         invoke<Provider[]>('get_providers'),
-        invoke<ProxyStatus>('get_proxy_status'),
-        invoke<AppSettings>('get_settings'),
       ]);
       setGroups(groupsResult);
       setProviders(providersResult.filter(p => p.is_active));
-      setProxyStatus(status);
-      setSettings(settingsResult);
     } catch (error) {
       console.error('Failed to load data:', error);
     }

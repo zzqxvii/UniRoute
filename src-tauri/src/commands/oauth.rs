@@ -1,9 +1,13 @@
 //! OAuth flow commands
 
 use chrono::{DateTime, Utc};
-use crate::state::AppState;
+use crate::state::{AppState, AppStateContainer};
 use std::sync::Arc;
 use tauri::State;
+
+fn get_state(container: &AppStateContainer) -> Option<Arc<AppState>> {
+    container.try_get()
+}
 
 /// OAuth 流程状态响应
 #[derive(serde::Serialize)]
@@ -20,8 +24,9 @@ pub struct OAuthFlowStatus {
 #[tauri::command]
 pub async fn start_oauth_flow(
     provider_id: String,
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, AppStateContainer>,
 ) -> Result<OAuthFlowStatus, String> {
+    let state = get_state(&state).ok_or("应用正在初始化")?;
     let provider = state.get_provider(&provider_id)
         .ok_or_else(|| "Provider 不存在".to_string())?;
 
@@ -45,8 +50,9 @@ pub async fn start_oauth_flow(
 #[tauri::command]
 pub async fn poll_oauth_token(
     provider_id: String,
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, AppStateContainer>,
 ) -> Result<crate::models::OAuthTokens, String> {
+    let state = get_state(&state).ok_or("应用正在初始化")?;
     let provider = state.get_provider(&provider_id)
         .ok_or_else(|| "Provider 不存在".to_string())?;
 
@@ -75,8 +81,9 @@ pub async fn poll_oauth_token(
 #[tauri::command]
 pub async fn refresh_oauth_token(
     provider_id: String,
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, AppStateContainer>,
 ) -> Result<crate::models::OAuthTokens, String> {
+    let state = get_state(&state).ok_or("应用正在初始化")?;
     let provider = state.get_provider(&provider_id)
         .ok_or_else(|| "Provider 不存在".to_string())?;
 
@@ -105,8 +112,9 @@ pub async fn refresh_oauth_token(
 #[tauri::command]
 pub async fn cancel_oauth_flow(
     provider_id: String,
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, AppStateContainer>,
 ) -> Result<(), String> {
+    let state = get_state(&state).ok_or("应用正在初始化")?;
     state.oauth_state.cancel_flow(&provider_id).await;
     Ok(())
 }
@@ -115,8 +123,9 @@ pub async fn cancel_oauth_flow(
 #[tauri::command]
 pub fn check_oauth_status(
     provider_id: String,
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, AppStateContainer>,
 ) -> Result<OAuthProviderStatus, String> {
+    let state = get_state(&state).ok_or("应用正在初始化")?;
     let provider = state.get_provider(&provider_id)
         .ok_or_else(|| "Provider 不存在".to_string())?;
 

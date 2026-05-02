@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 use tauri::Manager;
-use uniroute_lib::{commands::*, state::AppState};
+use uniroute_lib::{commands::*, state::{AppState, AppStateContainer}};
 
 fn main() {
     tracing_subscriber::fmt()
@@ -19,32 +19,45 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .setup(|app| {
-            let state = Arc::new(AppState::new().map_err(|e| {
-                tracing::error!("初始化应用状态失败: {}", e);
-                e
-            })?);
-            app.manage(state.clone());
+            // 立即注册空容器，窗口马上出现
+            let container = AppStateContainer::new();
+            app.manage(container);
 
-            // 检查是否需要自动启动代理
-            let settings = state.get_settings();
-            if settings.auto_start_proxy {
-                let port = settings.proxy_port;
-                tracing::info!("自动启动代理服务器，端口: {}", port);
+            // 后台初始化 AppState（含 reqwest::Client、SQLite 等）
+            let app_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let state = tokio::task::spawn_blocking(|| {
+                    AppState::new().map(Arc::new)
+                })
+                .await
+                .expect("AppState 初始化线程 panic")
+                .expect("AppState 初始化失败");
 
-                let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-                let state_for_proxy = Arc::clone(&state);
-                let state_handle = Arc::clone(&state);
+                tracing::info!("AppState 初始化完成");
 
-                // 使用 tauri 的异步运行时
-                tauri::async_runtime::spawn(async move {
-                    if let Err(e) = uniroute_lib::proxy::start_proxy_server(port, state_for_proxy, shutdown_rx).await {
-                        tracing::error!("代理服务器错误: {}", e);
-                    }
-                });
+                // 检查是否需要自动启动代理
+                let settings = state.get_settings();
+                if settings.auto_start_proxy {
+                    let port = settings.proxy_port;
+                    tracing::info!("自动启动代理服务器，端口: {}", port);
 
-                let handle = uniroute_lib::state::ProxyServerHandle { port, shutdown_tx };
-                *state_handle.proxy_server.write() = Some(handle);
-            }
+                    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+                    let state_for_proxy = Arc::clone(&state);
+
+                    tokio::spawn(async move {
+                        if let Err(e) = uniroute_lib::proxy::start_proxy_server(port, state_for_proxy, shutdown_rx).await {
+                            tracing::error!("代理服务器错误: {}", e);
+                        }
+                    });
+
+                    let handle = uniroute_lib::state::ProxyServerHandle { port, shutdown_tx };
+                    *state.proxy_server.write() = Some(handle);
+                }
+
+                // 设置到容器，后续命令可使用
+                let container = app_handle.state::<AppStateContainer>();
+                container.set(state).await;
+            });
 
             Ok(())
         })

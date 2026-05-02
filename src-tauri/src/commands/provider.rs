@@ -1,15 +1,19 @@
 //! Provider CRUD and test commands
 
 use crate::models::{Provider, ProviderTemplate};
-use crate::state::AppState;
+use crate::state::{AppState, AppStateContainer};
 use std::sync::Arc;
 use tauri::State;
+
+fn get_state(container: &AppStateContainer) -> Option<Arc<AppState>> {
+    container.try_get()
+}
 
 // ============ Provider Commands ============
 
 #[tauri::command]
-pub fn get_providers(state: State<'_, Arc<AppState>>) -> Vec<Provider> {
-    state.get_providers()
+pub fn get_providers(state: State<'_, AppStateContainer>) -> Vec<Provider> {
+    get_state(&state).map(|s| s.get_providers()).unwrap_or_default()
 }
 
 #[tauri::command]
@@ -30,8 +34,9 @@ pub fn create_provider(
     headers: Option<std::collections::HashMap<String, String>>,
     auth_header: Option<String>,
     auth_prefix: Option<String>,
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, AppStateContainer>,
 ) -> Result<Provider, String> {
+    let state = get_state(&state).ok_or("应用正在初始化")?;
     // 检查前缀是否已存在
     if state.get_provider_by_prefix(&prefix).is_some() {
         return Err(format!("前缀 '{}' 已被使用", prefix));
@@ -65,8 +70,9 @@ pub fn create_provider(
 pub fn update_provider(
     id: String,
     provider: Provider,
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, AppStateContainer>,
 ) -> Result<(), String> {
+    let state = get_state(&state).ok_or("应用正在初始化")?;
     // 检查前缀是否与其他 Provider 冲突
     if let Some(existing) = state.get_provider_by_prefix(&provider.prefix) {
         if existing.id != id {
@@ -78,7 +84,8 @@ pub fn update_provider(
 }
 
 #[tauri::command]
-pub fn delete_provider(id: String, state: State<'_, Arc<AppState>>) -> Result<(), String> {
+pub fn delete_provider(id: String, state: State<'_, AppStateContainer>) -> Result<(), String> {
+    let state = get_state(&state).ok_or("应用正在初始化")?;
     let provider = state.get_provider(&id)
         .ok_or_else(|| "供应商不存在".to_string())?;
 
@@ -111,8 +118,9 @@ pub struct BalanceInfo {
 #[tauri::command]
 pub async fn test_provider(
     id: String,
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, AppStateContainer>,
 ) -> Result<ProviderTestResult, String> {
+    let state = get_state(&state).ok_or("应用正在初始化")?;
     let provider = state.get_provider(&id)
         .ok_or_else(|| "供应商不存在".to_string())?;
 
@@ -216,18 +224,16 @@ async fn query_balance(_base_url: &str, api_key: &str, prefix: &str) -> Result<B
     // 解析不同供应商的余额格式
     match prefix {
         "ds" => {
-            // DeepSeek 格式
             tracing::info!("DeepSeek 响应: {}", serde_json::to_string(&json).unwrap_or_default());
 
             let is_available = json.get("is_available")
                 .and_then(|v| v.as_bool())
-                .unwrap_or(true); // 默认为可用
+                .unwrap_or(true);
 
             if !is_available {
                 return Err("账户不可用".to_string());
             }
 
-            // 尝试解析余额信息
             if let Some(balance_infos) = json.get("balance_infos").and_then(|v| v.as_array()) {
                 if let Some(info) = balance_infos.first() {
                     let total = info.get("total_balance")
@@ -248,7 +254,6 @@ async fn query_balance(_base_url: &str, api_key: &str, prefix: &str) -> Result<B
                 }
             }
 
-            // 备选格式：直接返回余额
             if let Some(balance) = json.get("balance") {
                 let total = balance.as_f64()
                     .map(|f| format!("{:.6}", f))
@@ -262,15 +267,11 @@ async fn query_balance(_base_url: &str, api_key: &str, prefix: &str) -> Result<B
                 });
             }
 
-            // 无法解析，返回原始响应
             Err(format!("无法解析余额信息: {}", serde_json::to_string(&json).unwrap_or_default()))
         }
         "ms" => {
-            // Moonshot (Kimi) 格式
             tracing::info!("Kimi API 响应: {}", serde_json::to_string(&json).unwrap_or_default());
 
-            // 尝试多种格式解析
-            // 格式1: { "data": { "available_balance": "xxx" } }
             if let Some(data) = json.get("data") {
                 let available = data.get("available_balance")
                     .or_else(|| data.get("availableBalance"))
@@ -289,7 +290,6 @@ async fn query_balance(_base_url: &str, api_key: &str, prefix: &str) -> Result<B
                 });
             }
 
-            // 格式2: 直接返回余额字段
             let available = json.get("available_balance")
                 .or_else(|| json.get("availableBalance"))
                 .or_else(|| json.get("balance"))
@@ -308,11 +308,9 @@ async fn query_balance(_base_url: &str, api_key: &str, prefix: &str) -> Result<B
                 });
             }
 
-            // 无法解析，返回原始响应作为详情
             Err(format!("无法解析余额信息: {}", serde_json::to_string(&json).unwrap_or_default()))
         }
         "zp" => {
-            // 智谱AI 格式
             tracing::info!("智谱AI 响应: {}", serde_json::to_string(&json).unwrap_or_default());
 
             let total_balance = json.get("totalBalance")

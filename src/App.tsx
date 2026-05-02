@@ -1,7 +1,7 @@
-import { useState, useEffect, useCallback, lazy, Suspense } from 'react';
+import { lazy, Suspense } from 'react';
 import { Routes, Route, Link, useLocation } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
-import { invoke } from '@tauri-apps/api/core';
+import { useProxy } from './components/ProxyContext';
 import { DashboardSkeleton } from './components/Skeleton';
 
 const Dashboard = lazy(() => import('./pages/Dashboard'));
@@ -16,23 +16,10 @@ const PageLoader = () => (
   </div>
 );
 
-interface ProxyStatus {
-  is_running: boolean;
-  port: number | null;
-}
-
-interface AppSettings {
-  proxy_port: number;
-  auto_start_proxy: boolean;
-  log_level: string;
-}
-
 function App() {
   const location = useLocation();
   const { i18n } = useTranslation();
-  const [proxyStatus, setProxyStatus] = useState<ProxyStatus>({ is_running: false, port: null });
-  const [settings, setSettings] = useState<AppSettings | null>(null);
-  const [proxyLoading, setProxyLoading] = useState(false);
+  const { proxyStatus, proxyLoading, toggleProxy } = useProxy();
 
   const navItems = [
     { path: '/', label: '仪表盘' },
@@ -45,43 +32,6 @@ function App() {
   const toggleLanguage = () => {
     const newLang = i18n.language === 'zh' ? 'en' : 'zh';
     i18n.changeLanguage(newLang);
-  };
-
-  const loadProxyStatus = useCallback(async () => {
-    try {
-      const [status, settingsResult] = await Promise.all([
-        invoke<ProxyStatus>('get_proxy_status'),
-        invoke<AppSettings>('get_settings'),
-      ]);
-      setProxyStatus(status);
-      setSettings(settingsResult);
-    } catch (error) {
-      console.error('Failed to load proxy status:', error);
-    }
-  }, []);
-
-  useEffect(() => {
-    loadProxyStatus();
-    // 定期刷新状态
-    const interval = setInterval(loadProxyStatus, 3000);
-    return () => clearInterval(interval);
-  }, [loadProxyStatus]);
-
-  const handleToggleProxy = async () => {
-    setProxyLoading(true);
-    try {
-      if (proxyStatus.is_running) {
-        await invoke('stop_proxy');
-      } else {
-        const port = settings?.proxy_port || 8080;
-        await invoke('start_proxy', { port });
-      }
-      setTimeout(loadProxyStatus, 500);
-    } catch (error) {
-      console.error('Proxy toggle failed:', error);
-    } finally {
-      setProxyLoading(false);
-    }
   };
 
   return (
@@ -115,7 +65,7 @@ function App() {
             <div className="flex items-center gap-3">
               {/* Proxy Toggle Button */}
               <button
-                onClick={handleToggleProxy}
+                onClick={toggleProxy}
                 disabled={proxyLoading}
                 className={`flex items-center gap-2 px-4 py-2 rounded-lg font-medium text-sm transition-all duration-200 ${
                   proxyStatus.is_running

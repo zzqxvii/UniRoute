@@ -26,7 +26,7 @@ i18n
     },
     ns: ['translation'],
     react: {
-      useSuspense: true,
+      useSuspense: false,
     },
   });
 

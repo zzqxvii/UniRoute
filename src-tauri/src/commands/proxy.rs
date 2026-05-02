@@ -1,14 +1,20 @@
 //! Proxy, benchmark, and diagnostic commands
 
 use serde::Serialize;
-use crate::state::AppState;
+use crate::state::{AppState, AppStateContainer};
 use std::sync::Arc;
 use tauri::State;
+
+/// 获取 AppState，未初始化时返回 None
+fn get_state(container: &AppStateContainer) -> Option<Arc<AppState>> {
+    container.try_get()
+}
 
 // ============ Proxy Commands ============
 
 #[tauri::command]
-pub async fn start_proxy(port: u16, state: State<'_, Arc<AppState>>) -> Result<(), String> {
+pub async fn start_proxy(port: u16, state: State<'_, AppStateContainer>) -> Result<(), String> {
+    let state = get_state(&state).ok_or("应用正在初始化")?;
     if state.is_proxy_running() {
         return Err("代理服务器已在运行".to_string());
     }
@@ -30,7 +36,8 @@ pub async fn start_proxy(port: u16, state: State<'_, Arc<AppState>>) -> Result<(
 }
 
 #[tauri::command]
-pub async fn stop_proxy(state: State<'_, Arc<AppState>>) -> Result<(), String> {
+pub async fn stop_proxy(state: State<'_, AppStateContainer>) -> Result<(), String> {
+    let state = get_state(&state).ok_or("应用正在初始化")?;
     let mut proxy = state.proxy_server.write();
     if let Some(handle) = proxy.take() {
         let _ = handle.shutdown_tx.send(());
@@ -40,7 +47,10 @@ pub async fn stop_proxy(state: State<'_, Arc<AppState>>) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn get_proxy_status(state: State<'_, Arc<AppState>>) -> ProxyStatus {
+pub fn get_proxy_status(state: State<'_, AppStateContainer>) -> ProxyStatus {
+    let Some(state) = get_state(&state) else {
+        return ProxyStatus { is_running: false, port: None };
+    };
     ProxyStatus {
         is_running: state.is_proxy_running(),
         port: state.get_proxy_port(),
@@ -85,8 +95,9 @@ pub struct BenchmarkResult {
 #[tauri::command]
 pub async fn benchmark_provider(
     request: BenchmarkRequest,
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, AppStateContainer>,
 ) -> Result<BenchmarkResult, String> {
+    let state = get_state(&state).ok_or("应用正在初始化")?;
     let start = std::time::Instant::now();
     let model = request.model.unwrap_or_else(|| "gpt-3.5-turbo".to_string());
 
@@ -97,7 +108,7 @@ pub async fn benchmark_provider(
     for provider_id in &request.provider_ids {
         let provider_id = provider_id.clone();
         let model = model.clone();
-        let state = Arc::clone(state.inner());
+        let state = Arc::clone(&state);
 
         handles.push(tokio::spawn(async move {
             ping_single_provider(&provider_id, &model, &state).await
@@ -268,8 +279,17 @@ pub struct ProviderDiagnostic {
 #[tauri::command]
 pub fn diagnose_route(
     model: String,
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, AppStateContainer>,
 ) -> RouteDiagnostic {
+    let Some(state) = get_state(&state) else {
+        return RouteDiagnostic {
+            requested_model: model,
+            group_found: None,
+            provider_resolution: None,
+            warnings: vec!["应用正在初始化".to_string()],
+        };
+    };
+
     let mut warnings = Vec::new();
 
     // 检查 Group（不限制端点类型）
@@ -351,7 +371,7 @@ pub fn diagnose_route(
     RouteDiagnostic {
         requested_model: model,
         group_found: group_info,
-        provider_resolution: None, // TODO: 可以扩展
+        provider_resolution: None,
         warnings,
     }
 }
@@ -378,8 +398,9 @@ pub async fn test_model_endpoint(
     provider_id: String,
     model: String,
     endpoint: String,
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, AppStateContainer>,
 ) -> Result<EndpointTestResult, String> {
+    let state = get_state(&state).ok_or("应用正在初始化")?;
     let provider = state.get_provider(&provider_id)
         .ok_or_else(|| "Provider 不存在".to_string())?;
 
@@ -593,8 +614,9 @@ pub struct RemoteModel {
 #[tauri::command]
 pub async fn fetch_provider_models(
     provider_id: String,
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, AppStateContainer>,
 ) -> Result<Vec<RemoteModel>, String> {
+    let state = get_state(&state).ok_or("应用正在初始化")?;
     let provider = state.get_provider(&provider_id)
         .ok_or_else(|| "Provider 不存在".to_string())?;
 

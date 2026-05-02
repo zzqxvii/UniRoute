@@ -2,19 +2,24 @@
 
 use serde::Serialize;
 use serde_json::Value as JsonValue;
-use crate::state::{AppSettings, AppState};
+use crate::state::{AppSettings, AppState, AppStateContainer};
 use std::sync::Arc;
 use tauri::State;
+
+fn get_state(container: &AppStateContainer) -> Option<Arc<AppState>> {
+    container.try_get()
+}
 
 // ============ Settings Commands ============
 
 #[tauri::command]
-pub fn get_settings(state: State<'_, Arc<AppState>>) -> AppSettings {
-    state.get_settings()
+pub fn get_settings(state: State<'_, AppStateContainer>) -> AppSettings {
+    get_state(&state).map(|s| s.get_settings()).unwrap_or_default()
 }
 
 #[tauri::command]
-pub fn update_settings(settings: AppSettings, state: State<'_, Arc<AppState>>) -> Result<(), String> {
+pub fn update_settings(settings: AppSettings, state: State<'_, AppStateContainer>) -> Result<(), String> {
+    let state = get_state(&state).ok_or("应用正在初始化")?;
     // 检查端口是否变化，如果代理正在运行则需要重启
     let old_settings = state.get_settings();
     let port_changed = old_settings.proxy_port != settings.proxy_port;
@@ -37,7 +42,7 @@ pub fn update_settings(settings: AppSettings, state: State<'_, Arc<AppState>>) -
         tracing::info!("用新端口 {} 重启代理服务器...", port);
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-        let state_for_proxy = Arc::clone(state.inner());
+        let state_for_proxy = Arc::clone(&state);
 
         tokio::spawn(async move {
             if let Err(e) = crate::proxy::start_proxy_server(port, state_for_proxy, shutdown_rx).await {
@@ -55,7 +60,8 @@ pub fn update_settings(settings: AppSettings, state: State<'_, Arc<AppState>>) -
 // ============ Data Import/Export ============
 
 #[tauri::command]
-pub fn export_data(state: State<'_, Arc<AppState>>) -> Result<String, String> {
+pub fn export_data(state: State<'_, AppStateContainer>) -> Result<String, String> {
+    let state = get_state(&state).ok_or("应用正在初始化")?;
     state.export_data().map_err(|e| e.to_string())
 }
 
@@ -63,8 +69,9 @@ pub fn export_data(state: State<'_, Arc<AppState>>) -> Result<String, String> {
 pub fn import_data(
     json: String,
     merge: bool,
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, AppStateContainer>,
 ) -> Result<ImportResultInfo, String> {
+    let state = get_state(&state).ok_or("应用正在初始化")?;
     let result = state.import_data(&json, merge).map_err(|e| e.to_string())?;
     Ok(ImportResultInfo {
         providers_imported: result.providers_imported,
@@ -75,8 +82,10 @@ pub fn import_data(
 }
 
 #[tauri::command]
-pub fn get_db_path(state: State<'_, Arc<AppState>>) -> String {
-    state.get_db_path().to_string_lossy().to_string()
+pub fn get_db_path(state: State<'_, AppStateContainer>) -> String {
+    get_state(&state)
+        .map(|s| s.get_db_path().to_string_lossy().to_string())
+        .unwrap_or_else(|| "~/.uniroute/uniroute.db".to_string())
 }
 
 #[derive(serde::Serialize)]

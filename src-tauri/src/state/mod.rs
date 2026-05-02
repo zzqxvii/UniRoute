@@ -422,3 +422,37 @@ impl Default for AppState {
         Self::new().expect("初始化应用状态失败")
     }
 }
+
+/// AppState 延迟初始化容器（非阻塞）
+///
+/// - Tauri 窗口立即出现（setup 不阻塞）
+/// - AppState 在后台线程初始化（`reqwest::Client::new()` 等重操作）
+/// - 命令调用时：已初始化则返回真实数据，未初始化则立即返回默认值
+/// - 前端秒渲染，数据异步填充
+pub struct AppStateContainer {
+    state: tokio::sync::RwLock<Option<Arc<AppState>>>,
+}
+
+impl AppStateContainer {
+    pub fn new() -> Self {
+        Self {
+            state: tokio::sync::RwLock::new(None),
+        }
+    }
+
+    /// 设置初始化完成的 AppState
+    pub async fn set(&self, state: Arc<AppState>) {
+        *self.state.write().await = Some(state);
+    }
+
+    /// 非阻塞获取：已初始化返回 Some，未初始化立即返回 None
+    pub fn try_get(&self) -> Option<Arc<AppState>> {
+        self.state.try_read().ok().and_then(|guard| guard.clone())
+    }
+}
+
+impl Default for AppStateContainer {
+    fn default() -> Self {
+        Self::new()
+    }
+}

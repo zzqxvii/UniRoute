@@ -1,16 +1,6 @@
 import { useState, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-
-interface ProxyStatus {
-  is_running: boolean;
-  port: number | null;
-}
-
-interface AppSettings {
-  proxy_port: number;
-  auto_start_proxy: boolean;
-  log_level: string;
-}
+import { useProxy } from '../components/ProxyContext';
 
 interface QuotaStatus {
   daily_used: number;
@@ -79,8 +69,7 @@ function TrafficChart({ data, maxValue, color }: { data: number[]; maxValue: num
 }
 
 function Dashboard() {
-  const [proxyStatus, setProxyStatus] = useState<ProxyStatus>({ is_running: false, port: null });
-  const [settings, setSettings] = useState<AppSettings | null>(null);
+  const { proxyStatus, settings } = useProxy();
   const [providerCount, setProviderCount] = useState(0);
   const [groupCount, setGroupCount] = useState(0);
   const [quotaStatus, setQuotaStatus] = useState<QuotaStatus | null>(null);
@@ -98,9 +87,7 @@ function Dashboard() {
   const loadData = async () => {
     try {
       setError(null);
-      const [status, settingsResult, providers, groups, quota, stats, traffic, health] = await Promise.all([
-        invoke<ProxyStatus>('get_proxy_status'),
-        invoke<AppSettings>('get_settings'),
+      const [providers, groups, quota, stats, traffic, health] = await Promise.all([
         invoke<{ id: string }[]>('get_providers'),
         invoke<{ id: string }[]>('get_groups'),
         invoke<QuotaStatus>('get_quota_status'),
@@ -108,8 +95,6 @@ function Dashboard() {
         invoke<HourlyTraffic[]>('get_hourly_traffic', { hours: 24 }),
         invoke<ProviderHealth[]>('get_provider_health', { hours: 24 }),
       ]);
-      setProxyStatus(status);
-      setSettings(settingsResult);
       setProviderCount(providers.length);
       setGroupCount(groups.length);
       setQuotaStatus(quota);

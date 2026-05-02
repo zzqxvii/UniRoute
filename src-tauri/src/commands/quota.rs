@@ -1,12 +1,18 @@
 //! Quota management commands
 
-use crate::state::AppState;
+use crate::state::{AppState, AppStateContainer};
 use std::sync::Arc;
 use tauri::State;
 
+fn get_state(container: &AppStateContainer) -> Option<Arc<AppState>> {
+    container.try_get()
+}
+
 #[tauri::command]
-pub fn get_quota_limit(state: State<'_, Arc<AppState>>) -> crate::models::QuotaLimit {
-    state.get_quota_limit()
+pub fn get_quota_limit(state: State<'_, AppStateContainer>) -> crate::models::QuotaLimit {
+    get_state(&state)
+        .map(|s| s.get_quota_limit())
+        .unwrap_or_default()
 }
 
 #[tauri::command]
@@ -14,8 +20,9 @@ pub fn update_quota_limit(
     daily_limit: Option<f64>,
     monthly_limit: Option<f64>,
     warning_threshold: Option<f64>,
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, AppStateContainer>,
 ) -> Result<(), String> {
+    let state = get_state(&state).ok_or("应用正在初始化")?;
     let mut quota = state.get_quota_limit();
     if let Some(d) = daily_limit {
         quota.daily_limit = if d > 0.0 { Some(d) } else { None };
@@ -30,6 +37,8 @@ pub fn update_quota_limit(
 }
 
 #[tauri::command]
-pub fn get_quota_status(state: State<'_, Arc<AppState>>) -> crate::models::QuotaStatus {
-    state.get_quota_status()
+pub fn get_quota_status(state: State<'_, AppStateContainer>) -> crate::models::QuotaStatus {
+    get_state(&state)
+        .map(|s| s.get_quota_status())
+        .unwrap_or_default()
 }
