@@ -14,7 +14,7 @@ use crate::models::RequestLog;
 use crate::router::{Router, chat_to_responses_response};
 use crate::state::AppState;
 
-use super::common::{is_sse_response, strip_sse_field, SseUsageCollector, create_logged_passthrough_stream, responses_error};
+use super::common::{build_response, is_sse_response, strip_sse_field, SseUsageCollector, create_logged_passthrough_stream, responses_error};
 
 /// Handle OpenAI Responses API requests
 pub async fn handle_responses(
@@ -227,13 +227,14 @@ pub async fn handle_responses(
                     });
 
                     use tokio_stream::wrappers::ReceiverStream;
-                    return builder
-                        .header("content-type", "text/event-stream")
-                        .header("cache-control", "no-cache")
-                        .header("connection", "keep-alive")
-                        .body(Body::from_stream(ReceiverStream::new(rx)))
-                        .unwrap_or_else(|_| Response::builder().status(500).body(Body::empty()).unwrap())
-                        .into_response();
+                    return build_response(
+                        builder
+                            .header("content-type", "text/event-stream")
+                            .header("cache-control", "no-cache")
+                            .header("connection", "keep-alive"),
+                        Body::from_stream(ReceiverStream::new(rx)),
+                    )
+                    .into_response();
                 } else {
                     // 非流式响应：读取并解析 JSON 提取 tokens
                     let body_bytes = response.bytes().await.unwrap_or_default();
@@ -261,8 +262,7 @@ pub async fn handle_responses(
                     log_entry = log_entry.with_status(status.as_u16() as i32).with_latency(latency);
                     state.save_request_log(&log_entry);
 
-                    return builder.body(Body::from(body_bytes))
-                        .unwrap_or_else(|_| Response::builder().status(500).body(Body::empty()).unwrap())
+                    return build_response(builder, Body::from(body_bytes))
                         .into_response();
                 }
             }
@@ -426,12 +426,13 @@ pub async fn handle_responses(
                         .with_error(error.to_string());
                     state.save_request_log(&log_entry);
 
-                    return Response::builder()
-                        .status(status.as_u16())
-                        .header("content-type", "application/json")
-                        .body(Body::from(serde_json::to_string(&response_json).unwrap_or_default()))
-                        .unwrap_or_else(|_| Response::builder().status(500).body(Body::empty()).unwrap())
-                        .into_response();
+                    return build_response(
+                        Response::builder()
+                            .status(status.as_u16())
+                            .header("content-type", "application/json"),
+                        Body::from(serde_json::to_string(&response_json).unwrap_or_default()),
+                    )
+                    .into_response();
                 }
 
                 // 检查上游是否已经返回 Responses 格式
@@ -486,6 +487,8 @@ pub async fn handle_responses(
                     }
                 } else {
                     // 将 OpenAI Chat 格式响应转换为 Responses 格式
+                    // 注意：此路径仅在 Router 已启用协议转换时可达（enable_protocol_transform=true）
+                    // Router 的 route_responses_raw 会在未启用时直接返回错误，不会到达此处
                     tracing::info!("上游返回 Chat 格式，转换为 Responses API 格式");
                     (chat_to_responses_response(&response_json, &requested_model), true)
                 };
@@ -512,12 +515,13 @@ pub async fn handle_responses(
 
                 state.save_request_log(&log_entry);
 
-                Response::builder()
-                    .status(status.as_u16())
-                    .header("content-type", "application/json")
-                    .body(Body::from(serde_json::to_string(&responses_response).unwrap_or_default()))
-                    .unwrap_or_else(|_| Response::builder().status(500).body(Body::empty()).unwrap())
-                    .into_response()
+                build_response(
+                    Response::builder()
+                        .status(status.as_u16())
+                        .header("content-type", "application/json"),
+                    Body::from(serde_json::to_string(&responses_response).unwrap_or_default()),
+                )
+                .into_response()
             }
         }
         (None, Some(error_msg)) => {

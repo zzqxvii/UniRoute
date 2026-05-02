@@ -10,7 +10,7 @@ use crate::models::RequestLog;
 use crate::router::Router;
 use crate::state::AppState;
 
-use super::common::{is_sse_response, SseUsageCollector, create_logged_passthrough_stream, claude_error};
+use super::common::{build_response, is_sse_response, SseUsageCollector, create_logged_passthrough_stream, claude_error};
 
 /// Handle Claude-compatible messages
 /// 直连模式：直接转发原始请求到上游的 /v1/messages 端点，不做格式转换
@@ -203,12 +203,13 @@ pub async fn handle_claude_messages(
 
                 state.save_request_log(&log_entry);
 
-                Response::builder()
-                    .status(status.as_u16())
-                    .header("content-type", "application/json")
-                    .body(Body::from(body_bytes))
-                    .unwrap_or_else(|_| Response::builder().status(500).body(Body::empty()).unwrap())
-                    .into_response()
+                build_response(
+                    Response::builder()
+                        .status(status.as_u16())
+                        .header("content-type", "application/json"),
+                    Body::from(body_bytes),
+                )
+                .into_response()
             }
         }
         (None, Some(error_msg)) => {

@@ -21,7 +21,7 @@ tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", features = ["json", "stream"] }
 axum = "0.7"
 tower = "0.5"
-tower-http = { version = "0.5", features = ["cors"] }
+tower-http = { version = "0.5", features = ["cors", "limit", "trace", "request-id", "set-header"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }
@@ -46,9 +46,18 @@ urlencoding = "2.1"
 regex = "1.12.3"
 toml_edit = "0.22"
 
+[profile.dev.package."*"]
+opt-level = 1
+debug = false
+
 [profile.release]
 panic = "abort"
 codegen-units = 1
 lto = true
 opt-level = "s"
 strip = true
+
+[profile.ci]
+inherits = "release"
+lto = false
+opt-level = 2

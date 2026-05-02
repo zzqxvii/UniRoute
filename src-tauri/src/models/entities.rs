@@ -447,10 +447,43 @@ impl ProviderEndpoint {
 pub enum GroupStrategy { #[default]
 Priority, RoundRobin, Random, Weighted, LeastUsed, CostOptimized }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GroupConfig {
+    #[serde(default)]
     pub retry_delay_ms: i32,
+    #[serde(default)]
     pub max_retries: i32,
+    /// 退避倍数（默认 2.0）
+    #[serde(default = "default_backoff_multiplier")]
+    pub backoff_multiplier: f32,
+    /// 最大延迟毫秒（默认 5000）
+    #[serde(default = "default_max_delay_ms")]
+    pub max_delay_ms: u64,
+}
+fn default_backoff_multiplier() -> f32 { 2.0 }
+fn default_max_delay_ms() -> u64 { 5000 }
+
+impl Default for GroupConfig {
+    fn default() -> Self {
+        Self {
+            retry_delay_ms: 0,
+            max_retries: 0,
+            backoff_multiplier: 2.0,
+            max_delay_ms: 5000,
+        }
+    }
+}
+
+impl GroupConfig {
+    /// 转换为 RetryConfig 供重试模块使用
+    pub fn to_retry_config(&self) -> crate::router::RetryConfig {
+        crate::router::RetryConfig {
+            max_retries: self.max_retries.max(0) as u32,
+            initial_delay_ms: if self.retry_delay_ms > 0 { self.retry_delay_ms as u64 } else { 250 },
+            max_delay_ms: self.max_delay_ms,
+            backoff_multiplier: self.backoff_multiplier,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -495,6 +528,10 @@ pub struct Group {
     /// - gemini: Gemini API
     #[serde(default)]
     pub endpoint_type: Option<String>,
+    /// 是否启用协议转换（默认 false = 不转换，直连透传）
+    /// 启用后，当请求格式与 Provider 格式不匹配时会自动转换
+    #[serde(default)]
+    pub enable_protocol_transform: bool,
     pub is_active: bool,
     pub created_at: DateTime<Utc>, pub updated_at: DateTime<Utc>,
 }
@@ -510,6 +547,7 @@ impl Group {
             strategy: GroupStrategy::default(),
             config: GroupConfig::default(),
             endpoint_type: None,
+            enable_protocol_transform: false,
             is_active: true,
             created_at: now,
             updated_at: now,

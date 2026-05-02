@@ -87,7 +87,9 @@ impl Database {
                 config TEXT,
                 is_active INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                endpoint_type TEXT,
+                enable_protocol_transform INTEGER NOT NULL DEFAULT 0
             );
 
             -- Group Models
@@ -321,6 +323,14 @@ impl Database {
             )?;
         }
 
+        if !groups_columns.contains(&"enable_protocol_transform".to_string()) {
+            tracing::info!("添加 enable_protocol_transform 列到 groups 表");
+            db.execute(
+                "ALTER TABLE groups ADD COLUMN enable_protocol_transform INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+
         // 重建 groups 表，移除 name UNIQUE 约束，改为 (name, endpoint_type) 复合唯一
         // 检查是否还有 name 的 UNIQUE 约束
         let has_name_unique: bool = db
@@ -343,10 +353,11 @@ impl Database {
                     is_active INTEGER NOT NULL DEFAULT 1,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
-                    endpoint_type TEXT
+                    endpoint_type TEXT,
+                    enable_protocol_transform INTEGER NOT NULL DEFAULT 0
                 )",
                 // 2. 复制数据
-                "INSERT INTO groups_new SELECT id, name, description, strategy, config, is_active, created_at, updated_at, endpoint_type FROM groups",
+                "INSERT INTO groups_new SELECT id, name, description, strategy, config, is_active, created_at, updated_at, endpoint_type, enable_protocol_transform FROM groups",
                 // 3. 删除旧表
                 "DROP TABLE groups",
                 // 4. 重命名新表
@@ -553,10 +564,10 @@ impl Database {
     pub fn save_group(&self, group: &Group) -> Result<()> {
         let db = self.conn.lock();
         db.execute(
-            r#"INSERT INTO groups (id, name, description, strategy, config, is_active, created_at, updated_at, endpoint_type)
-               VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
+            r#"INSERT INTO groups (id, name, description, strategy, config, is_active, created_at, updated_at, endpoint_type, enable_protocol_transform)
+               VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
                ON CONFLICT(id) DO UPDATE SET
-                 name=?2, description=?3, strategy=?4, config=?5, is_active=?6, updated_at=?8, endpoint_type=?9"#,
+                 name=?2, description=?3, strategy=?4, config=?5, is_active=?6, updated_at=?8, endpoint_type=?9, enable_protocol_transform=?10"#,
             rusqlite::params![
                 group.id, group.name, group.description,
                 serde_json::to_string(&group.strategy)?,
@@ -565,6 +576,7 @@ impl Database {
                 group.created_at.to_rfc3339(),
                 group.updated_at.to_rfc3339(),
                 group.endpoint_type,
+                group.enable_protocol_transform as i32,
             ],
         ).map_err(|e| {
             if e.to_string().contains("UNIQUE constraint failed") {
@@ -589,7 +601,7 @@ impl Database {
     pub fn load_groups(&self) -> Result<Vec<Group>> {
         let db = self.conn.lock();
         let mut stmt = db.prepare(
-            "SELECT id, name, description, strategy, config, is_active, created_at, updated_at, endpoint_type FROM groups ORDER BY name"
+            "SELECT id, name, description, strategy, config, is_active, created_at, updated_at, endpoint_type, enable_protocol_transform FROM groups ORDER BY name"
         )?;
         let groups = stmt
             .query_map([], |row| {
@@ -608,6 +620,7 @@ impl Database {
                     updated_at: parse_dt(&updated_str),
                     models: Vec::new(),
                     endpoint_type: row.get(8)?,
+                    enable_protocol_transform: row.get::<_, i32>(9).unwrap_or(0) != 0,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;

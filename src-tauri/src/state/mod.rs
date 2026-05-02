@@ -13,6 +13,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+type HeaderCache = HashMap<String, Arc<reqwest::header::HeaderMap>>;
+
 /// 应用设置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
@@ -107,6 +109,8 @@ pub struct AppState {
     pub rate_limiter: Arc<RateLimiter>,
     /// 共享熔断器（跨请求保持状态）
     pub circuit_breaker: Arc<CircuitBreaker>,
+    /// Provider 请求头缓存（provider_id -> cached HeaderMap）
+    pub header_cache: RwLock<HeaderCache>,
 }
 
 /// 代理服务器句柄
@@ -149,6 +153,7 @@ impl AppState {
             http_client: reqwest::Client::new(),
             rate_limiter: Arc::new(RateLimiter::new()),
             circuit_breaker: Arc::new(CircuitBreaker::new()),
+            header_cache: RwLock::new(HashMap::new()),
         })
     }
 
@@ -178,6 +183,7 @@ impl AppState {
 
     pub fn update_provider(&self, id: &str, updated: Provider) -> Result<()> {
         self.db.save_provider(&updated).context("更新供应商失败")?;
+        self.invalidate_header_cache(id);
         let mut providers = self.providers.write();
         if let Some(idx) = providers.iter().position(|p| p.id == id) {
             providers[idx] = updated;
@@ -187,8 +193,31 @@ impl AppState {
 
     pub fn delete_provider(&self, id: &str) -> Result<()> {
         self.db.delete_provider(id).context("删除供应商失败")?;
+        self.invalidate_header_cache(id);
         self.providers.write().retain(|p| p.id != id);
         Ok(())
+    }
+
+    // ============ Header 缓存 ============
+
+    /// 获取缓存的请求头，未命中返回 None
+    pub fn get_cached_headers(&self, provider_id: &str) -> Option<Arc<reqwest::header::HeaderMap>> {
+        self.header_cache.read().get(provider_id).cloned()
+    }
+
+    /// 写入请求头缓存
+    pub fn set_cached_headers(&self, provider_id: String, headers: Arc<reqwest::header::HeaderMap>) {
+        self.header_cache.write().insert(provider_id, headers);
+    }
+
+    /// 清除指定 provider 的请求头缓存
+    pub fn invalidate_header_cache(&self, provider_id: &str) {
+        self.header_cache.write().remove(provider_id);
+    }
+
+    /// 清除所有请求头缓存
+    pub fn clear_header_cache(&self) {
+        self.header_cache.write().clear();
     }
 
     // ============ Group 管理 ============
@@ -258,7 +287,7 @@ impl AppState {
     }
 
     pub fn update_settings(&self, settings: AppSettings) {
-        let _ = self.db.save_setting("settings", &serde_json::to_string(&settings).unwrap());
+        let _ = self.db.save_setting("settings", &serde_json::to_string(&settings).unwrap_or_default());
         *self.settings.write() = settings;
     }
 

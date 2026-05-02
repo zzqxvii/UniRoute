@@ -12,7 +12,7 @@ use crate::models::{ChatRequest, RequestLog};
 use crate::router::Router;
 use crate::state::AppState;
 
-use super::common::{is_sse_response, SseUsageCollector, create_logged_passthrough_stream};
+use super::common::{build_response, is_sse_response, SseUsageCollector, create_logged_passthrough_stream};
 
 /// Handle OpenAI-compatible chat completions
 pub async fn handle_chat_completions(
@@ -276,18 +276,30 @@ pub async fn handle_chat_completions(
                         .with_error(error.to_string());
                     state.save_request_log(&log_entry);
 
-                    return Response::builder()
-                        .status(status.as_u16())
-                        .header("content-type", "application/json")
-                        .body(Body::from(serde_json::to_string(&response_json).unwrap_or_default()))
-                        .unwrap_or_else(|_| Response::builder().status(500).body(Body::empty()).unwrap())
-                        .into_response();
+                    return build_response(
+                        Response::builder()
+                            .status(status.as_u16())
+                            .header("content-type", "application/json"),
+                        Body::from(serde_json::to_string(&response_json).unwrap_or_default()),
+                    )
+                    .into_response();
                 }
 
-                // 检查上游是否返回了 Responses API 格式（需要转换为 Chat 格式）
+                // 检查上游是否返回了 Responses API 格式
                 let (final_response, needs_conversion) = if response_json.get("output").is_some() && response_json.get("choices").is_none() {
-                    tracing::info!("上游返回 Responses API 格式，转换为 Chat Completions 格式");
-                    (crate::router::responses_to_chat_response(&response_json, &info.requested_model), true)
+                    if info.enable_protocol_transform {
+                        // 启用了协议转换：转换为 Chat 格式
+                        tracing::info!("上游返回 Responses API 格式，启用协议转换，转换为 Chat Completions 格式");
+                        (crate::router::responses_to_chat_response(&response_json, &info.requested_model), true)
+                    } else {
+                        // 默认模式：直接透传 Responses API 格式响应
+                        tracing::info!("上游返回 Responses API 格式，未启用协议转换，直接透传");
+                        let mut result = response_json.clone();
+                        if let Some(obj) = result.as_object_mut() {
+                            obj.insert("model".to_string(), json!(info.requested_model));
+                        }
+                        (result, false)
+                    }
                 } else {
                     // 确保响应中的模型名是用户请求的模型名
                     let mut result = response_json.clone();

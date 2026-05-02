@@ -31,7 +31,7 @@ pub fn responses_to_chat_request(responses_req: &ResponsesRequest) -> ChatReques
                             // 也处理 Responses API 格式: [{"type": "input_text", "text": "..."}]
                             let parts: Vec<ContentPart> = c
                                 .as_array()
-                                .unwrap()
+                                .unwrap_or(&vec![])
                                 .iter()
                                 .filter_map(|part| {
                                     let part_type = part.get("type").and_then(|t| t.as_str()).unwrap_or("text");

@@ -34,6 +34,8 @@ pub struct RouteInfo {
     pub protocol_transform: Option<String>,
     /// 端点类型（如果指定）
     pub endpoint_type: Option<String>,
+    /// 是否启用了协议转换（来自 Group 配置）
+    pub enable_protocol_transform: bool,
 }
 
 /// 路由结果 - 返回原始 HTTP 响应
@@ -68,6 +70,7 @@ impl RouteResult {
                 actual_url: None,
                 protocol_transform: None,
                 endpoint_type: endpoint_type.map(|s| s.to_string()),
+                enable_protocol_transform: false,
             },
             actual_request_body: None,
         }
@@ -137,6 +140,7 @@ impl Router {
                         actual_url: None,
                         protocol_transform: None,
                     endpoint_type: None,
+                    enable_protocol_transform: false,
                     },
                     actual_request_body: None,
                 };
@@ -160,6 +164,7 @@ impl Router {
                         actual_url: None,
                         protocol_transform: None,
                     endpoint_type: None,
+                    enable_protocol_transform: false,
                     },
                     actual_request_body: None,
                 };
@@ -194,6 +199,7 @@ impl Router {
                         actual_url: None,
                         protocol_transform: None,
                     endpoint_type: None,
+                    enable_protocol_transform: false,
                     },
                     actual_request_body: None,
                 };
@@ -214,6 +220,7 @@ impl Router {
                         actual_url: None,
                         protocol_transform: None,
                     endpoint_type: None,
+                    enable_protocol_transform: false,
                     },
                     actual_request_body: None,
                 };
@@ -277,9 +284,9 @@ impl Router {
         // 3. 尝试通过 Group 查找 (responses 端点)
         let group = self.find_group(&requested_model, Some("responses"));
 
-        if let Some(group) = group {
+        if let Some(ref group) = group {
             // 检查 Group 中是否有模型支持 responses 端点
-            let ordered_models = self.select_model_by_strategy(&group);
+            let ordered_models = self.select_model_by_strategy(group);
 
             for group_model in &ordered_models {
                 if let Some((provider, actual_model, _)) = self.resolve_model(&group_model.model) {
@@ -312,13 +319,68 @@ impl Router {
                 }
             }
 
-            // 没有模型支持 responses 端点，转换为 Chat 格式
-            tracing::info!("Group '{}' 没有模型支持 Responses 端点，转换为 Chat 格式", group.name);
+            // 没有模型支持 responses 端点
+            if !group.enable_protocol_transform {
+                // 默认不转换：返回错误
+                tracing::warn!(
+                    "Group '{}' 没有模型支持 Responses 端点，且未启用协议转换",
+                    group.name
+                );
+                return RouteResult {
+                    response: None,
+                    error: Some(format!(
+                        "模型 '{}' 不支持 Responses API，且 Group '{}' 未启用协议转换。请启用协议转换或使用支持 Responses 的 Provider",
+                        requested_model, group.name
+                    )),
+                    info: RouteInfo {
+                        provider_name: None,
+                        provider_prefix: None,
+                        actual_model: None,
+                        requested_model,
+                        actual_url: None,
+                        protocol_transform: None,
+                        endpoint_type: Some("responses".to_string()),
+                        enable_protocol_transform: false,
+                    },
+                    actual_request_body: None,
+                };
+            }
+
+            // 启用了协议转换：降级为 Chat 格式
+            tracing::info!("Group '{}' 启用了协议转换，降级为 Chat 格式", group.name);
         }
 
         // 4. 降级：转换为 Chat 请求
-        tracing::info!("模型 '{}' 不支持 Responses 端点或未找到，转换为 Chat 格式", requested_model);
-        
+        // 到达此处说明：没有找到支持 Responses 的 Provider
+        // - 如果有 Group 且 enable_protocol_transform=true → 降级转换
+        // - 否则 → 返回错误
+        let Some(ref _group) = group else {
+            // 没有 Group，无法转换
+            tracing::warn!("模型 '{}' 不支持 Responses API，且未找到匹配的 Group", requested_model);
+            return RouteResult {
+                response: None,
+                error: Some(format!(
+                    "模型 '{}' 不支持 Responses API。请在 Group 配置中启用协议转换，或使用支持 Responses 的 Provider",
+                    requested_model
+                )),
+                info: RouteInfo {
+                    provider_name: None,
+                    provider_prefix: None,
+                    actual_model: None,
+                    requested_model,
+                    actual_url: None,
+                    protocol_transform: None,
+                    endpoint_type: Some("responses".to_string()),
+                    enable_protocol_transform: false,
+                },
+                actual_request_body: None,
+            };
+        };
+
+        // Group 存在但未启用协议转换（已在上面 if 块中返回错误）
+        // 到达此处说明 Group 启用了协议转换
+        tracing::info!("模型 '{}' 不支持 Responses 端点，降级为 Chat 格式", requested_model);
+
         // 解析为 ResponsesRequest 再转换
         match serde_json::from_value::<ResponsesRequest>(raw_body.clone()) {
             Ok(responses_request) => {
@@ -337,6 +399,7 @@ impl Router {
                         actual_url: None,
                         protocol_transform: None,
                         endpoint_type: None,
+                        enable_protocol_transform: false,
                     },
                     actual_request_body: None,
                 }
@@ -416,6 +479,7 @@ impl Router {
                 actual_url: None,
                 protocol_transform: None,
                 endpoint_type: Some("messages".to_string()),
+                enable_protocol_transform: false,
             },
             actual_request_body: None,
         }
@@ -436,6 +500,7 @@ impl Router {
             requested_model,
             "/v1/messages",
             "messages",
+            None,
         ).await
     }
 
@@ -454,10 +519,12 @@ impl Router {
             requested_model,
             "/v1/responses",
             "responses",
+            None,
         ).await
     }
 
     /// 通用原始请求发送方法（带三级延迟重试）
+    #[allow(clippy::too_many_arguments)]
     async fn execute_raw_request(
         &self,
         provider: &Provider,
@@ -466,8 +533,10 @@ impl Router {
         requested_model: String,
         endpoint_path: &str,
         endpoint_type: &str,
+        retry_config: Option<&RetryConfig>,
     ) -> RouteResult {
-        let retry_config = RetryConfig::default();
+        let default_config = RetryConfig::default();
+        let retry_config = retry_config.unwrap_or(&default_config);
         let circuit_key = format!("{}:{}", provider.prefix, actual_model);
 
         // 检查熔断器
@@ -546,6 +615,7 @@ impl Router {
             actual_url: Some(url.clone()),
             protocol_transform: Some("direct".to_string()),
             endpoint_type: Some(endpoint_type.to_string()),
+            enable_protocol_transform: false,
         };
 
         // 重试循环
@@ -593,7 +663,7 @@ impl Router {
 
                         let cooldown = self.rate_limiter.get_cooldown_remaining(&provider.id).await;
 
-                        let delay = retry::compute_retry_delay(attempt, &retry_config, retry_after, cooldown);
+                        let delay = retry::compute_retry_delay(attempt, retry_config, retry_after, cooldown);
                         tracing::warn!(
                             "{} 请求返回可重试状态码 {}: 延迟 {:?} 后重试",
                             endpoint_type, status, delay
@@ -619,7 +689,7 @@ impl Router {
                     self.circuit_breaker.record_failure(&circuit_key).await;
                     last_error = Some(format!("请求失败: {}", e));
                     if attempt < retry_config.max_retries {
-                        let delay = retry::compute_retry_delay(attempt, &retry_config, None, None);
+                        let delay = retry::compute_retry_delay(attempt, retry_config, None, None);
                         tokio::time::sleep(delay).await;
                         continue;
                     }
@@ -683,6 +753,7 @@ impl Router {
                     actual_url: None,
                     protocol_transform: None,
                     endpoint_type: None,
+                    enable_protocol_transform: group.enable_protocol_transform,
                 },
                 actual_request_body: None,
             };
@@ -709,7 +780,8 @@ impl Router {
 
             request.model = actual_model.clone();
 
-            let result = self.execute_with_provider(&provider, &actual_model, request.clone(), requested_model.clone()).await;
+            let group_retry_config = group.config.to_retry_config();
+            let result = self.execute_with_provider(&provider, &actual_model, request.clone(), requested_model.clone(), group.enable_protocol_transform, Some(&group_retry_config)).await;
 
             if result.response.is_some() {
                 // 记录模型使用
@@ -745,6 +817,7 @@ impl Router {
                 actual_url: None,
                 protocol_transform: None,
                     endpoint_type: None,
+                    enable_protocol_transform: group.enable_protocol_transform,
             },
             actual_request_body: None,
         })
@@ -766,13 +839,14 @@ impl Router {
                         actual_url: None,
                         protocol_transform: None,
                     endpoint_type: None,
+                    enable_protocol_transform: false,
                     },
                     actual_request_body: None,
                 };
             }
         };
 
-        self.execute_with_provider(&provider, &actual_model, request, requested_model).await
+        self.execute_with_provider(&provider, &actual_model, request, requested_model, false, None).await
     }
 
     /// 使用 Group 执行 embedding 请求
@@ -781,7 +855,7 @@ impl Router {
             return RouteResult {
                 response: None,
                 error: Some(format!("Group '{}' 没有配置模型", group.name)),
-                info: RouteInfo { provider_name: None, provider_prefix: None, actual_model: None, requested_model, actual_url: None, protocol_transform: None, endpoint_type: None },
+                info: RouteInfo { provider_name: None, provider_prefix: None, actual_model: None, requested_model, actual_url: None, protocol_transform: None, endpoint_type: None, enable_protocol_transform: false },
                 actual_request_body: None,
             };
         }
@@ -815,7 +889,7 @@ impl Router {
         last_result.unwrap_or_else(|| RouteResult {
             response: None,
             error: Some(format!("Group '{}' 所有模型都失败了", group.name)),
-            info: RouteInfo { provider_name: None, provider_prefix: None, actual_model: None, requested_model, actual_url: None, protocol_transform: None, endpoint_type: None },
+            info: RouteInfo { provider_name: None, provider_prefix: None, actual_model: None, requested_model, actual_url: None, protocol_transform: None, endpoint_type: None, enable_protocol_transform: false },
             actual_request_body: None,
         })
     }
@@ -828,7 +902,7 @@ impl Router {
                 return RouteResult {
                     response: None,
                     error: Some(format!("无法解析模型: {}", model)),
-                    info: RouteInfo { provider_name: None, provider_prefix: None, actual_model: None, requested_model, actual_url: None, protocol_transform: None, endpoint_type: None },
+                    info: RouteInfo { provider_name: None, provider_prefix: None, actual_model: None, requested_model, actual_url: None, protocol_transform: None, endpoint_type: None, enable_protocol_transform: false },
                     actual_request_body: None,
                 };
             }
@@ -868,6 +942,7 @@ impl Router {
             actual_url: Some(url.clone()),
             protocol_transform: Some("direct".to_string()),
             endpoint_type: None,
+            enable_protocol_transform: false,
         };
 
         let body = serde_json::json!({
@@ -1028,8 +1103,11 @@ impl Router {
         actual_model: &str,
         mut request: ChatRequest,
         requested_model: String,
+        enable_protocol_transform: bool,
+        retry_config: Option<&RetryConfig>,
     ) -> RouteResult {
-        let retry_config = RetryConfig::default();
+        let default_config = RetryConfig::default();
+        let retry_config = retry_config.unwrap_or(&default_config);
         let circuit_key = format!("{}:{}", provider.prefix, actual_model);
 
         // 检查熔断器
@@ -1098,6 +1176,7 @@ impl Router {
             actual_url: Some(url.clone()),
             protocol_transform: Some("direct".to_string()),
             endpoint_type: None,
+            enable_protocol_transform,
         };
 
         request.model = actual_model.to_string();
@@ -1126,8 +1205,8 @@ impl Router {
                         .iter()
                         .filter(|(_, v)| {
                             v.is_null() ||
-                            (v.is_array() && v.as_array().unwrap().is_empty()) ||
-                            (v.is_object() && v.as_object().unwrap().is_empty())
+                            (v.is_array() && v.as_array().is_some_and(|a| a.is_empty())) ||
+                            (v.is_object() && v.as_object().is_some_and(|o| o.is_empty()))
                         })
                         .map(|(k, _)| k.clone())
                         .collect();
@@ -1186,7 +1265,7 @@ impl Router {
                     last_error = Some(format!("请求发送失败: {}", e));
                     // 网络错误可重试
                     if attempt < retry_config.max_retries {
-                        let delay = retry::compute_retry_delay(attempt, &retry_config, None, None);
+                        let delay = retry::compute_retry_delay(attempt, retry_config, None, None);
                         tokio::time::sleep(delay).await;
                         continue;
                     }
@@ -1226,7 +1305,7 @@ impl Router {
 
                 let cooldown = self.rate_limiter.get_cooldown_remaining(&provider.id).await;
 
-                let delay = retry::compute_retry_delay(attempt, &retry_config, retry_after, cooldown);
+                let delay = retry::compute_retry_delay(attempt, retry_config, retry_after, cooldown);
                 tracing::warn!(
                     "请求返回可重试状态码 {}: 延迟 {:?} 后重试 (attempt={}/{})",
                     status, delay, attempt, retry_config.max_retries
@@ -1337,8 +1416,13 @@ impl Router {
         Ok(url)
     }
 
-    /// 构建请求头（带 Provider 自定义配置）
+    /// 构建请求头（带 Provider 自定义配置，带缓存）
     fn build_headers_with_provider(&self, auth_value: &str, provider: &Provider) -> anyhow::Result<reqwest::header::HeaderMap> {
+        // 检查缓存
+        if let Some(cached) = self.state.get_cached_headers(&provider.id) {
+            return Ok((*cached).clone());
+        }
+
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert("Content-Type", "application/json".parse()?);
 
@@ -1374,20 +1458,31 @@ impl Router {
             }
         }
 
+        // 写入缓存
+        let cached = Arc::new(headers.clone());
+        self.state.set_cached_headers(provider.id.clone(), cached);
+
         Ok(headers)
     }
 
-    /// 判断是否应该 fallback
+    /// 判断是否应该 fallback 到下一个 provider
     fn should_fallback(error_str: &str) -> bool {
         let error_lower = error_str.to_lowercase();
 
-        error_lower.contains("timeout")
-            || error_lower.contains("connection")
-            || error_lower.contains("503")
-            || error_lower.contains("502")
-            || error_lower.contains("500")
-            || error_lower.contains("429")
-            || error_lower.contains("rate limit")
+        // 连接/超时类错误
+        if error_lower.contains("timeout") || error_lower.contains("connection") {
+            return true;
+        }
+
+        // 从错误消息中提取 HTTP 状态码并使用统一的可重试判断
+        for code in [408, 429, 500, 502, 503, 504, 529] {
+            if error_lower.contains(&code.to_string()) {
+                return retry::is_retryable_status(code);
+            }
+        }
+
+        // 速率限制关键词
+        error_lower.contains("rate limit")
     }
 }
 
@@ -1432,6 +1527,7 @@ mod tests {
             strategy,
             config: Default::default(),
             endpoint_type: None,
+            enable_protocol_transform: false,
             is_active: true,
             created_at: now,
             updated_at: now,

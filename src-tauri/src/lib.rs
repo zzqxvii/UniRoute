@@ -5,6 +5,10 @@
 //! - 智能路由和故障转移
 //! - 模型别名映射
 
+#![warn(clippy::unwrap_used)]
+#![warn(clippy::expect_used)]
+#![warn(clippy::panic)]
+
 pub mod client_config;
 pub mod commands;
 pub mod error;

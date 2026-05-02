@@ -10,6 +10,19 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Mutex;
 
+/// 安全构建 HTTP 响应，失败时返回 500 空响应
+pub fn build_response(builder: axum::http::response::Builder, body: Body) -> Response {
+    builder
+        .body(body)
+        .unwrap_or_else(|_| {
+            tracing::error!("构建响应失败，回退到 500");
+            Response::builder()
+                .status(500)
+                .body(Body::from("internal response build error"))
+                .expect("500 fallback is infallible")
+        })
+}
+
 /// 判断响应是否是 SSE 流式响应
 pub fn is_sse_response(response: &reqwest::Response) -> bool {
     // 检查 content-type
@@ -286,12 +299,13 @@ pub fn responses_error(status: u16, message: impl Into<String>) -> Response {
             "param": null
         }
     });
-    Response::builder()
-        .status(status)
-        .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_string(&body).unwrap_or_default()))
-        .unwrap_or_else(|_| Response::builder().status(500).body(Body::empty()).unwrap())
-        .into_response()
+    build_response(
+        Response::builder()
+            .status(status)
+            .header("content-type", "application/json"),
+        Body::from(serde_json::to_string(&body).unwrap_or_default()),
+    )
+    .into_response()
 }
 
 /// 创建 Claude 格式错误响应
@@ -305,12 +319,13 @@ pub fn claude_error(status: u16, message: impl Into<String>) -> Response {
             "message": msg
         }
     });
-    Response::builder()
-        .status(status)
-        .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_string(&body).unwrap_or_default()))
-        .unwrap_or_else(|_| Response::builder().status(500).body(Body::empty()).unwrap())
-        .into_response()
+    build_response(
+        Response::builder()
+            .status(status)
+            .header("content-type", "application/json"),
+        Body::from(serde_json::to_string(&body).unwrap_or_default()),
+    )
+    .into_response()
 }
 
 /// 计算请求成本（公共逻辑）
