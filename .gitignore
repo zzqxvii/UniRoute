@@ -99,3 +99,5 @@ __pycache__/
 venv/
 vendor/
 tmp/
+
+.spec-workspace

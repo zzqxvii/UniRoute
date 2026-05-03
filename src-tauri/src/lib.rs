@@ -9,6 +9,7 @@
 #![warn(clippy::expect_used)]
 #![warn(clippy::panic)]
 
+pub mod cli_config;
 pub mod client_config;
 pub mod commands;
 pub mod error;

@@ -76,6 +76,23 @@ npx tsc --noEmit
 - **共享 HTTP 客户端**，在 `AppState` 中创建单个 `reqwest::Client` 并在所有请求中复用
 - **错误处理**使用 `error.rs` 中的 `AppError` 枚举（`thiserror` 派生），避免在生产代码路径中使用 `unwrap()`
 
+## Rust ↔ TypeScript 字段命名规范（serde 序列化）
+
+**核心规则**：TypeScript 接口字段名必须与 Rust struct 经 serde 序列化后的 JSON key 完全一致。具体取决于 Rust 端是否有 `#[serde(rename_all = "camelCase")]`：
+
+| 模块 | Rust struct 位置 | serde 配置 | TS 字段名风格 | 示例 |
+|------|-----------------|-----------|-------------|------|
+| `cli_config` | `src-tauri/src/cli_config/types.rs` | `#[serde(rename_all = "camelCase")]` | **camelCase** | `toolId`, `displayName`, `takenOver`, `configPath` |
+| `cli_config` (manager) | `src-tauri/src/cli_config/manager.rs` | `#[serde(rename_all = "camelCase")]` | **camelCase** | `autoTakeoverOnStart`, `autoRestoreOnStop`, `apiKey` |
+| 核心实体 | `src-tauri/src/models/entities.rs` | 无 rename（默认 snake_case） | **snake_case** | `endpoint_type`, `is_active`, `created_at`, `enable_protocol_transform` |
+| 其他 commands 返回值 | `src-tauri/src/commands/*.rs` | 视具体 struct 而定 | **先检查 Rust 源码** | — |
+
+**添加新类型时的检查清单**：
+1. 查看 Rust struct 是否有 `#[serde(rename_all = "camelCase")]`
+2. 有 → TypeScript 用 camelCase（如 `toolId`）
+3. 无 → TypeScript 用 snake_case（如 `tool_id`）
+4. 不确定时，用 `console.log()` 打印 Tauri invoke 返回值确认实际 key 名
+
 ## 已知限制
 
 - 协议转换有损：reasoning 输入项被丢弃、refusal 类型被跳过、`max_output_tokens` 存在 u64→u32 截断

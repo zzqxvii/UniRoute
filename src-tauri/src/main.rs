@@ -124,6 +124,23 @@ fn main() {
             test_model_endpoint,
             // Fetch Models
             fetch_provider_models,
+            // CLI Tools
+            get_supported_cli_tools,
+            get_cli_tools_status,
+            get_cli_tool_status,
+            takeover_cli_tool,
+            restore_cli_tool,
+            restore_all_cli_tools,
+            update_cli_tool_model,
+            get_cli_global_settings,
+            update_cli_global_settings,
+            get_cli_tool_config,
+            get_all_cli_tool_configs,
+            save_cli_tool_config,
+            get_cli_tool_current_config,
+            list_cli_tool_snapshots,
+            restore_cli_tool_from_snapshot,
+            open_cli_config_dir,
             // Client Configuration
             get_client_config_status,
             apply_claude_config,

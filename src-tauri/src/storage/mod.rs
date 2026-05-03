@@ -149,6 +149,26 @@ impl Database {
                 total_cost REAL NOT NULL DEFAULT 0
             );
 
+            -- CLI Tool Configs (CLI 工具配置)
+            CREATE TABLE IF NOT EXISTS cli_tool_configs (
+                tool_id TEXT PRIMARY KEY,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                auto_takeover INTEGER NOT NULL DEFAULT 1,
+                source_type TEXT NOT NULL DEFAULT 'group',
+                source_value TEXT NOT NULL DEFAULT 'free',
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            -- CLI Config Snapshots (接管前备份)
+            CREATE TABLE IF NOT EXISTS cli_config_snapshots (
+                id TEXT PRIMARY KEY,
+                tool_id TEXT NOT NULL,
+                snapshot_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (tool_id) REFERENCES cli_tool_configs(tool_id) ON DELETE CASCADE
+            );
+
             CREATE INDEX IF NOT EXISTS idx_providers_prefix ON providers(prefix);
             CREATE INDEX IF NOT EXISTS idx_groups_name ON groups(name);
             CREATE INDEX IF NOT EXISTS idx_group_models_group ON group_models(group_id);
@@ -1067,6 +1087,137 @@ impl Database {
             })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(stats)
+    }
+
+    // ============ CLI Tool Configs ============
+
+    /// 保存 CLI 工具配置
+    pub fn save_cli_tool_config(&self, config: &crate::cli_config::types::CliToolConfig) -> Result<()> {
+        let db = self.conn.lock();
+        db.execute(
+            r#"INSERT OR REPLACE INTO cli_tool_configs (tool_id, enabled, auto_takeover, source_type, source_value, updated_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'))"#,
+            rusqlite::params![
+                config.tool_id,
+                config.enabled as i32,
+                config.auto_takeover as i32,
+                config.source_type,
+                config.source_value,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// 读取 CLI 工具配置
+    pub fn load_cli_tool_config(&self, tool_id: &str) -> Result<Option<crate::cli_config::types::CliToolConfig>> {
+        let db = self.conn.lock();
+        let config = db
+            .query_row(
+                r#"SELECT tool_id, enabled, auto_takeover, source_type, source_value
+                   FROM cli_tool_configs WHERE tool_id = ?1"#,
+                rusqlite::params![tool_id],
+                |row| {
+                    Ok(crate::cli_config::types::CliToolConfig {
+                        tool_id: row.get(0)?,
+                        enabled: row.get::<_, i32>(1)? != 0,
+                        auto_takeover: row.get::<_, i32>(2)? != 0,
+                        source_type: row.get(3)?,
+                        source_value: row.get(4)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(config)
+    }
+
+    /// 读取所有 CLI 工具配置
+    pub fn load_all_cli_tool_configs(&self) -> Result<HashMap<String, crate::cli_config::types::CliToolConfig>> {
+        let db = self.conn.lock();
+        let mut stmt = db.prepare(
+            r#"SELECT tool_id, enabled, auto_takeover, source_type, source_value
+               FROM cli_tool_configs"#,
+        )?;
+        let configs = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    crate::cli_config::types::CliToolConfig {
+                        tool_id: row.get(0)?,
+                        enabled: row.get::<_, i32>(1)? != 0,
+                        auto_takeover: row.get::<_, i32>(2)? != 0,
+                        source_type: row.get(3)?,
+                        source_value: row.get(4)?,
+                    },
+                ))
+            })?
+            .collect::<Result<HashMap<_, _>, _>>()?;
+        Ok(configs)
+    }
+
+    /// 删除 CLI 工具配置
+    pub fn delete_cli_tool_config(&self, tool_id: &str) -> Result<()> {
+        let db = self.conn.lock();
+        db.execute(
+            "DELETE FROM cli_tool_configs WHERE tool_id = ?1",
+            rusqlite::params![tool_id],
+        )?;
+        Ok(())
+    }
+
+    // ============ CLI Config Snapshots ============
+
+    /// 保存快照到数据库
+    pub fn save_cli_config_snapshot(&self, id: &str, tool_id: &str, snapshot_json: &str, created_at: &str) -> Result<()> {
+        let db = self.conn.lock();
+        db.execute(
+            r#"INSERT OR REPLACE INTO cli_config_snapshots (id, tool_id, snapshot_json, created_at)
+               VALUES (?1, ?2, ?3, ?4)"#,
+            rusqlite::params![id, tool_id, snapshot_json, created_at],
+        )?;
+        Ok(())
+    }
+
+    /// 列出某工具的所有快照（不含 snapshot_json 内容，仅元数据）
+    pub fn list_cli_config_snapshots(&self, tool_id: &str) -> Result<Vec<crate::cli_config::types::SnapshotInfo>> {
+        let db = self.conn.lock();
+        let mut stmt = db.prepare(
+            r#"SELECT id, tool_id, created_at, length(snapshot_json)
+               FROM cli_config_snapshots WHERE tool_id = ?1 ORDER BY created_at DESC"#,
+        )?;
+        let snapshots = stmt
+            .query_map(rusqlite::params![tool_id], |row| {
+                Ok(crate::cli_config::types::SnapshotInfo {
+                    id: row.get(0)?,
+                    tool_id: row.get(1)?,
+                    created_at: row.get(2)?,
+                    size_bytes: row.get::<_, Option<i64>>(3)?.unwrap_or(0) as u64,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(snapshots)
+    }
+
+    /// 加载单个快照的完整 JSON
+    pub fn load_cli_config_snapshot(&self, id: &str) -> Result<Option<String>> {
+        let db = self.conn.lock();
+        let result = db
+            .query_row(
+                "SELECT snapshot_json FROM cli_config_snapshots WHERE id = ?1",
+                rusqlite::params![id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(result)
+    }
+
+    /// 删除单个快照
+    pub fn delete_cli_config_snapshot(&self, id: &str) -> Result<()> {
+        let db = self.conn.lock();
+        db.execute(
+            "DELETE FROM cli_config_snapshots WHERE id = ?1",
+            rusqlite::params![id],
+        )?;
+        Ok(())
     }
 
     /// 获取供应商健康状态

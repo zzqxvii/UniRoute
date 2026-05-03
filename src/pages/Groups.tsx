@@ -1,6 +1,5 @@
 import { useState, useEffect, useMemo } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { useProxy } from '../components/ProxyContext';
 
 // 端点类型定义
 interface EndpointInfo {
@@ -62,23 +61,12 @@ interface Provider {
   is_active: boolean;
 }
 
-type ConfigType = 'claude' | 'codex' | 'opencode' | 'cursor' | 'custom';
-
 function Groups() {
-  const { proxyStatus, settings } = useProxy();
   const [groups, setGroups] = useState<Group[]>([]);
   const [providers, setProviders] = useState<Provider[]>([]);
   const [selectedEndpoint, setSelectedEndpoint] = useState<string>('chat');
   const [showModal, setShowModal] = useState(false);
   const [editingGroup, setEditingGroup] = useState<Group | null>(null);
-  const [showConfigModal, setShowConfigModal] = useState(false);
-  const [selectedGroup, setSelectedGroup] = useState<Group | null>(null);
-  const [configType, setConfigType] = useState<ConfigType>('claude');
-  const [claudeConfig, setClaudeConfig] = useState('');
-  const [codexAuth, setCodexAuth] = useState('');
-  const [codexConfig, setCodexConfig] = useState('');
-  const [configLoading, setConfigLoading] = useState(false);
-  const [configSaving, setConfigSaving] = useState(false);
 
   useEffect(() => {
     loadData();
@@ -96,10 +84,6 @@ function Groups() {
       console.error('Failed to load data:', error);
     }
   };
-
-  const baseUrl = useMemo(() => {
-    return `http://127.0.0.1:${proxyStatus.port || settings?.proxy_port || 8080}`;
-  }, [proxyStatus.port, settings?.proxy_port]);
 
   // 按端点过滤 Groups
   const filteredGroups = useMemo(() => {
@@ -120,24 +104,6 @@ function Groups() {
     return counts;
   }, [groups]);
 
-  // 根据端点类型获取可用的配置类型
-  const getConfigTypes = (_endpointType?: string): { type: ConfigType; name: string; description: string }[] => {
-    const configs: Record<string, { type: ConfigType; name: string; description: string }[]> = {
-      claude: [
-        { type: 'claude', name: 'Claude Code', description: '~/.claude/settings.json' },
-      ],
-      responses: [
-        { type: 'codex', name: 'Codex CLI', description: '~/.codex/config.toml + auth.json' },
-        { type: 'opencode', name: 'OpenCode', description: '~/.codex/config.toml + auth.json' },
-      ],
-      chat: [
-        { type: 'codex', name: 'Codex CLI', description: '~/.codex/config.toml + auth.json' },
-        { type: 'opencode', name: 'OpenCode', description: '~/.codex/config.toml + auth.json' },
-      ],
-    };
-    return configs[_endpointType || 'chat'] || configs['chat'];
-  };
-
   const handleDelete = async (id: string) => {
     if (confirm('确定要删除这个 Group 吗？')) {
       try {
@@ -146,90 +112,6 @@ function Groups() {
       } catch (error) {
         alert('删除失败: ' + error);
       }
-    }
-  };
-
-  // 打开配置模态框并加载当前配置
-  const handleOpenConfigModal = async (group: Group, type: ConfigType) => {
-    setSelectedGroup(group);
-    setConfigType(type);
-    setConfigLoading(true);
-    setShowConfigModal(true);
-
-    try {
-      if (type === 'claude') {
-        const config = await invoke<string>('read_claude_config', {
-          baseUrl: baseUrl,
-          groupName: group.name,
-        });
-        setClaudeConfig(config);
-      } else {
-        const [auth, config] = await invoke<[string, string]>('read_codex_config', {
-          baseUrl: baseUrl + '/v1',
-          groupName: group.name,
-        });
-        setCodexAuth(auth);
-        setCodexConfig(config);
-      }
-    } catch (error) {
-      console.error('读取配置失败:', error);
-      // 设置默认配置
-      if (type === 'claude') {
-        // base_url 不带 /v1 后缀，Claude Code 会自动添加
-        const cleanBaseUrl = baseUrl.replace(/\/v1$/, '');
-        setClaudeConfig(JSON.stringify({
-          env: {
-            ANTHROPIC_BASE_URL: cleanBaseUrl,
-            ANTHROPIC_AUTH_TOKEN: "uniroute",
-            ANTHROPIC_MODEL: group.name,
-            ANTHROPIC_DEFAULT_OPUS_MODEL: group.name,
-            ANTHROPIC_DEFAULT_SONNET_MODEL: group.name,
-            ANTHROPIC_DEFAULT_HAIKU_MODEL: group.name
-          }
-        }, null, 2));
-      } else {
-        setCodexAuth(JSON.stringify({
-          OPENAI_API_KEY: "uniroute"
-        }, null, 2));
-        setCodexConfig(`model_provider = "uniroute"
-model = "${group.name}"
-
-[model_providers.uniroute]
-name = "UniRoute"
-base_url = "${baseUrl}/v1"
-wire_api = "responses"
-requires_openai_auth = true`);
-      }
-    } finally {
-      setConfigLoading(false);
-    }
-  };
-
-  // 保存配置
-  const handleSaveConfig = async () => {
-    if (!selectedGroup) return;
-    
-    setConfigSaving(true);
-    try {
-      if (configType === 'claude') {
-        await invoke('apply_claude_config', { config: claudeConfig });
-      } else {
-        await invoke('apply_codex_config', { auth: codexAuth, config: codexConfig });
-      }
-      setShowConfigModal(false);
-    } catch (error) {
-      alert('保存配置失败: ' + error);
-    } finally {
-      setConfigSaving(false);
-    }
-  };
-
-  // 打开配置目录
-  const handleOpenConfigDir = async (type: ConfigType) => {
-    try {
-      await invoke('open_client_config_dir', { clientType: type });
-    } catch (error) {
-      alert('打开目录失败: ' + error);
     }
   };
 
@@ -346,28 +228,6 @@ requires_openai_auth = true`);
                       )}
                     </div>
                     <div className="flex items-center gap-1">
-                      {/* 配置按钮 - 根据端点类型显示下拉菜单 */}
-                      <div className="relative group">
-                        <button
-                          className="text-gray-400 hover:text-emerald-600 p-1"
-                          title="配置客户端"
-                        >
-                          <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
-                          </svg>
-                        </button>
-                        <div className="absolute right-0 mt-1 w-40 bg-white dark:bg-gray-800 rounded-lg shadow-lg border border-gray-200 dark:border-gray-700 opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all z-10">
-                          {getConfigTypes(group.endpoint_type).map(cfg => (
-                            <button
-                              key={cfg.type}
-                              onClick={() => handleOpenConfigModal(group, cfg.type)}
-                              className="w-full px-3 py-2 text-left text-sm hover:bg-gray-100 dark:hover:bg-gray-700 first:rounded-t-lg last:rounded-b-lg"
-                            >
-                              {cfg.name}
-                            </button>
-                          ))}
-                        </div>
-                      </div>
                       <button
                         onClick={() => {
                           setEditingGroup(group);
@@ -436,110 +296,6 @@ requires_openai_auth = true`);
         />
       )}
 
-      {/* Config Editor Modal */}
-      {showConfigModal && selectedGroup && (
-        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4" onClick={(e) => e.target === e.currentTarget && setShowConfigModal(false)}>
-          <div className="bg-white dark:bg-gray-800 rounded-xl shadow-2xl w-full max-w-2xl max-h-[90vh] flex flex-col overflow-hidden">
-            <div className="px-6 py-4 border-b border-gray-200 dark:border-gray-700 shrink-0">
-              <div className="flex items-center justify-between">
-                <div>
-                  <h3 className="text-lg font-semibold text-gray-900 dark:text-white">
-                    {configType === 'claude' ? 'Claude Code' : 'Codex CLI'} 配置
-                  </h3>
-                  <p className="text-sm text-gray-500 dark:text-gray-400 mt-1">
-                    Group: <code className="font-mono text-indigo-600 dark:text-indigo-400">{selectedGroup.name}</code>
-                  </p>
-                </div>
-                <button
-                  onClick={() => handleOpenConfigDir(configType)}
-                  className="text-sm text-indigo-600 hover:text-indigo-700 dark:text-indigo-400"
-                >
-                  打开目录
-                </button>
-              </div>
-            </div>
-
-            <div className="px-6 py-5 overflow-y-auto flex-1">
-              {configLoading ? (
-                <div className="text-center py-8 text-gray-500">加载中...</div>
-              ) : configType === 'claude' ? (
-                <div className="space-y-4">
-                  <div>
-                    <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
-                      ~/.claude/settings.json
-                    </label>
-                    <textarea
-                      value={claudeConfig}
-                      onChange={(e) => setClaudeConfig(e.target.value)}
-                      className="w-full h-64 px-3 py-2 font-mono text-sm bg-gray-900 text-green-400 rounded-lg border-0 focus:ring-2 focus:ring-indigo-500"
-                      spellCheck={false}
-                    />
-                  </div>
-                  <div className="p-3 bg-blue-50 dark:bg-blue-900/20 rounded-lg text-sm text-blue-700 dark:text-blue-300">
-                    <b>配置说明：</b>
-                    <ul className="mt-1 list-disc list-inside text-xs space-y-1">
-                      <li><code>env</code> 中的环境变量会直接生效</li>
-                      <li><code>ANTHROPIC_MODEL</code>: 默认模型（Group 名称）</li>
-                      <li><code>ANTHROPIC_BASE_URL</code>: UniRoute 代理地址</li>
-                    </ul>
-                  </div>
-                </div>
-              ) : (
-                <div className="space-y-4">
-                  <div>
-                    <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
-                      ~/.codex/auth.json
-                    </label>
-                    <textarea
-                      value={codexAuth}
-                      onChange={(e) => setCodexAuth(e.target.value)}
-                      className="w-full h-32 px-3 py-2 font-mono text-sm bg-gray-900 text-green-400 rounded-lg border-0 focus:ring-2 focus:ring-indigo-500"
-                      spellCheck={false}
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
-                      ~/.codex/config.toml
-                    </label>
-                    <textarea
-                      value={codexConfig}
-                      onChange={(e) => setCodexConfig(e.target.value)}
-                      className="w-full h-64 px-3 py-2 font-mono text-sm bg-gray-900 text-green-400 rounded-lg border-0 focus:ring-2 focus:ring-indigo-500"
-                      spellCheck={false}
-                    />
-                  </div>
-                  <div className="p-3 bg-blue-50 dark:bg-blue-900/20 rounded-lg text-sm text-blue-700 dark:text-blue-300">
-                    <b>配置说明：</b>
-                    <ul className="mt-1 list-disc list-inside text-xs space-y-1">
-                      <li><code>model</code>: 请求时使用的模型名称（Group 名称）</li>
-                      <li><code>base_url</code>: UniRoute 代理地址</li>
-                      <li><code>wire_api = "responses"</code>: 使用 Responses API 格式</li>
-                    </ul>
-                  </div>
-                </div>
-              )}
-            </div>
-
-            <div className="px-6 py-4 border-t border-gray-200 dark:border-gray-700 flex justify-end gap-3">
-              <button
-                type="button"
-                onClick={() => setShowConfigModal(false)}
-                className="px-4 py-2 text-sm font-medium text-gray-700 dark:text-gray-300 hover:text-gray-900 dark:hover:text-white"
-              >
-                取消
-              </button>
-              <button
-                type="button"
-                onClick={handleSaveConfig}
-                disabled={configSaving}
-                className="px-4 py-2 text-sm font-medium text-white bg-indigo-600 hover:bg-indigo-700 rounded-lg disabled:opacity-50"
-              >
-                {configSaving ? '保存中...' : '保存配置'}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   );
 }

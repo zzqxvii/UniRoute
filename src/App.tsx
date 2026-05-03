@@ -9,6 +9,7 @@ const Providers = lazy(() => import('./pages/Providers'));
 const Groups = lazy(() => import('./pages/Groups'));
 const Logs = lazy(() => import('./pages/Logs'));
 const Settings = lazy(() => import('./pages/Settings'));
+const CliTools = lazy(() => import('./pages/CliTools'));
 
 const PageLoader = () => (
   <div className="px-4 py-6 sm:px-0">
@@ -25,6 +26,7 @@ function App() {
     { path: '/', label: '仪表盘' },
     { path: '/providers', label: '供应商' },
     { path: '/groups', label: '组合' },
+    { path: '/cli-tools', label: 'CLI工具' },
     { path: '/logs', label: '日志' },
     { path: '/settings', label: '设置' },
   ];
@@ -98,6 +100,7 @@ function App() {
             <Route path="/groups" element={<Groups />} />
             <Route path="/logs" element={<Logs />} />
             <Route path="/settings" element={<Settings />} />
+            <Route path="/cli-tools" element={<CliTools />} />
           </Routes>
         </Suspense>
       </main>

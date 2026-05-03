@@ -7,6 +7,7 @@ mod config;
 mod pricing;
 mod quota;
 mod oauth;
+mod cli_config;
 
 pub use proxy::*;
 pub use provider::*;
@@ -15,3 +16,4 @@ pub use config::*;
 pub use pricing::*;
 pub use quota::*;
 pub use oauth::*;
+pub use cli_config::*;

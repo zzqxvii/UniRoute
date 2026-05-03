@@ -5,6 +5,7 @@
 use crate::models::{Group, ModelMapping, Provider, ProviderTemplate, QuotaLimit, QuotaStatus, RequestLog};
 use crate::oauth::OAuthState;
 use crate::pricing::PricingManager;
+use crate::cli_config::manager::CliConfigManager;
 use crate::router::{RateLimiter, CircuitBreaker};
 use crate::storage::Database;
 use anyhow::{Context, Result};
@@ -111,6 +112,8 @@ pub struct AppState {
     pub circuit_breaker: Arc<CircuitBreaker>,
     /// Provider 请求头缓存（provider_id -> cached HeaderMap）
     pub header_cache: RwLock<HeaderCache>,
+    /// CLI 工具配置管理器
+    pub cli_config_manager: Arc<CliConfigManager>,
 }
 
 /// 代理服务器句柄
@@ -140,11 +143,14 @@ impl AppState {
             let _ = pricing_manager.load_user_pricing(&pricing_json);
         }
 
+        let db = Arc::new(db);
+        let cli_config_manager = Arc::new(CliConfigManager::new(db.clone()));
+
         Ok(Self {
             providers: RwLock::new(providers),
             groups: RwLock::new(groups),
             model_mappings: RwLock::new(model_mappings),
-            db: Arc::new(db),
+            db,
             proxy_server: RwLock::new(None),
             settings: RwLock::new(settings),
             oauth_state: OAuthState::new(),
@@ -154,6 +160,7 @@ impl AppState {
             rate_limiter: Arc::new(RateLimiter::new()),
             circuit_breaker: Arc::new(CircuitBreaker::new()),
             header_cache: RwLock::new(HashMap::new()),
+            cli_config_manager,
         })
     }
 
