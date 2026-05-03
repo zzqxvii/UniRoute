@@ -167,6 +167,18 @@ pub fn list_cli_tool_snapshots(
         .unwrap_or_default()
 }
 
+/// 获取快照的配置内容（用于预览）
+#[tauri::command]
+pub fn get_cli_tool_snapshot_content(
+    snapshot_id: String,
+    state: State<'_, AppStateContainer>,
+) -> Result<Vec<ConfigFileEntry>, String> {
+    let state = get_state(&state).ok_or("应用正在初始化")?;
+    state.cli_config_manager
+        .get_snapshot_content(&snapshot_id)
+        .map_err(|e| e.to_string())
+}
+
 /// 从已保存快照恢复 CLI 工具配置
 #[tauri::command]
 pub fn restore_cli_tool_from_snapshot(

@@ -87,42 +87,10 @@ pub async fn start_proxy_server(
 
     tracing::info!("Proxy server listening on {}", addr);
 
-    // Auto-takeover CLI tools on proxy start
-    let proxy_url = format!("http://127.0.0.1:{}/v1", port);
-    let cli_mgr = state.cli_config_manager.clone();
-    let settings = cli_mgr.get_global_settings();
-    if settings.auto_takeover_on_start {
-        match state.db.load_all_cli_tool_configs() {
-            Ok(configs) => {
-                let results = cli_mgr.takeover_all_enabled(&proxy_url, &configs);
-                for r in &results {
-                    if r.success {
-                        tracing::info!("CLI auto-takeover: {}", r.message);
-                    } else {
-                        tracing::warn!("CLI auto-takeover failed: {}", r.message);
-                    }
-                }
-            }
-            Err(e) => tracing::warn!("Failed to load CLI configs for auto-takeover: {e}"),
-        }
-    }
-
-    let cli_mgr2 = state.cli_config_manager.clone();
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             let _ = shutdown_rx.await;
             tracing::info!("Proxy server shutting down");
-
-            // Auto-restore CLI tools on proxy stop
-            let settings = cli_mgr2.get_global_settings();
-            if settings.auto_restore_on_stop {
-                let results = cli_mgr2.restore_all();
-                for r in &results {
-                    if r.success {
-                        tracing::info!("CLI auto-restore: {}", r.message);
-                    }
-                }
-            }
         })
         .await?;
 

@@ -45,8 +45,8 @@ pub struct CliGlobalSettings {
 impl Default for CliGlobalSettings {
     fn default() -> Self {
         Self {
-            auto_takeover_on_start: true,
-            auto_restore_on_stop: true,
+            auto_takeover_on_start: false,
+            auto_restore_on_stop: false,
             api_key: "uniroute".to_string(),
         }
     }
@@ -393,6 +393,26 @@ impl CliConfigManager {
     /// 列出某工具的已保存快照
     pub fn list_saved_snapshots(&self, tool_id: &str) -> Vec<SnapshotInfo> {
         self.db.list_cli_config_snapshots(tool_id).unwrap_or_default()
+    }
+
+    /// 获取快照的配置内容（用于预览）
+    pub fn get_snapshot_content(&self, snapshot_id: &str) -> Result<Vec<ConfigFileEntry>, AppError> {
+        let snapshot_json = self.db.load_cli_config_snapshot(snapshot_id)?
+            .ok_or_else(|| AppError::Config(format!("快照不存在: {snapshot_id}")))?;
+
+        let snapshot: ConfigSnapshot = serde_json::from_str(&snapshot_json)
+            .map_err(|e| AppError::Config(format!("解析快照失败: {e}")))?;
+
+        let mut files = Vec::new();
+        for (path, content) in &snapshot.files {
+            let filename = path.file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            let content_str = String::from_utf8_lossy(content).into_owned();
+            files.push(ConfigFileEntry { filename, content: content_str });
+        }
+        Ok(files)
     }
 
     /// 从数据库快照恢复

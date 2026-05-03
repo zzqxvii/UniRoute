@@ -139,6 +139,7 @@ fn main() {
             save_cli_tool_config,
             get_cli_tool_current_config,
             list_cli_tool_snapshots,
+            get_cli_tool_snapshot_content,
             restore_cli_tool_from_snapshot,
             open_cli_config_dir,
             // Client Configuration

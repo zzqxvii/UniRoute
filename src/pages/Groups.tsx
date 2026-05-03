@@ -9,19 +9,19 @@ interface EndpointInfo {
   description: string;
 }
 
+export const DEFAULT_GROUP_NAME = 'default';
+
+export function sortDefaultFirst(a: { name: string }, b: { name: string }): number {
+  if (a.name === DEFAULT_GROUP_NAME) return -1;
+  if (b.name === DEFAULT_GROUP_NAME) return 1;
+  return 0;
+}
+
 const ENDPOINTS: EndpointInfo[] = [
-  { id: 'chat', label: 'Chat', path: '/v1/chat/completions', description: '标准对话 API' },
-  { id: 'responses', label: 'Responses', path: '/v1/responses', description: '响应 API (Codex, OpenCode)' },
-  { id: 'claude', label: 'Claude', path: '/v1/messages', description: 'Claude 消息 API' },
+  { id: 'chat', label: 'Chat', path: '/v1/chat/completions', description: '标准对话 API（OpenAI 兼容）' },
+  { id: 'responses', label: 'Responses', path: '/v1/responses', description: '响应 API（Codex、OpenCode）' },
+  { id: 'claude', label: 'Claude', path: '/v1/messages', description: 'Claude Messages API' },
   { id: 'gemini', label: 'Gemini', path: '/v1beta/models/{model}:generateContent', description: 'Gemini API' },
-  { id: 'embeddings', label: '嵌入', path: '/v1/embeddings', description: '向量嵌入' },
-  { id: 'images', label: '图像', path: '/v1/images/generations', description: '图像生成' },
-  { id: 'videos', label: '视频', path: '/v1/videos/generations', description: '视频生成' },
-  { id: 'music', label: '音乐', path: '/v1/music/generations', description: '音乐生成' },
-  { id: 'audio', label: '语音', path: '/v1/audio/transcriptions', description: '语音转文字' },
-  { id: 'tts', label: '语音合成', path: '/v1/audio/speech', description: '文字转语音' },
-  { id: 'moderation', label: '审核', path: '/v1/moderations', description: '内容审核' },
-  { id: 'rerank', label: '重排', path: '/v1/rerank', description: '搜索结果重排' },
 ];
 
 interface Group {
@@ -85,13 +85,14 @@ function Groups() {
     }
   };
 
-  // 按端点过滤 Groups
+  // 按端点过滤 Groups，"default" 排最前
   const filteredGroups = useMemo(() => {
-    return groups.filter(g => {
-      // 没有 endpoint_type 的 Group 归类到 chat
-      const epType = g.endpoint_type || 'chat';
-      return epType === selectedEndpoint;
-    });
+    return groups
+      .filter(g => {
+        const epType = g.endpoint_type || 'chat';
+        return epType === selectedEndpoint;
+      })
+      .sort(sortDefaultFirst);
   }, [groups, selectedEndpoint]);
 
   // 统计每个端点的 Group 数量
@@ -104,7 +105,11 @@ function Groups() {
     return counts;
   }, [groups]);
 
-  const handleDelete = async (id: string) => {
+  const handleDelete = async (id: string, name: string) => {
+    if (name === DEFAULT_GROUP_NAME) {
+      alert('默认分组不可删除');
+      return;
+    }
     if (confirm('确定要删除这个 Group 吗？')) {
       try {
         await invoke('delete_group', { id });
@@ -226,6 +231,11 @@ function Groups() {
                           已禁用
                         </span>
                       )}
+                      {group.name === DEFAULT_GROUP_NAME && (
+                        <span className="text-xs px-1.5 py-0.5 bg-indigo-100 dark:bg-indigo-900/30 text-indigo-600 dark:text-indigo-300 rounded">
+                          默认
+                        </span>
+                      )}
                     </div>
                     <div className="flex items-center gap-1">
                       <button
@@ -234,19 +244,22 @@ function Groups() {
                           setShowModal(true);
                         }}
                         className="text-gray-400 hover:text-indigo-600 p-1"
+                        title={group.name === DEFAULT_GROUP_NAME ? '编辑模型（默认分组不可改名或删除）' : '编辑'}
                       >
                         <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
                         </svg>
                       </button>
-                      <button
-                        onClick={() => handleDelete(group.id)}
-                        className="text-gray-400 hover:text-red-600 p-1"
-                      >
-                        <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
-                        </svg>
-                      </button>
+                      {group.name !== DEFAULT_GROUP_NAME && (
+                        <button
+                          onClick={() => handleDelete(group.id, group.name)}
+                          className="text-gray-400 hover:text-red-600 p-1"
+                        >
+                          <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                          </svg>
+                        </button>
+                      )}
                     </div>
                   </div>
 
@@ -303,7 +316,7 @@ function Groups() {
 function GroupModal({
   group,
   providers,
-  endpointType: _endpointType,
+  endpointType,
   onClose,
 }: {
   group: Group | null;
@@ -311,7 +324,6 @@ function GroupModal({
   endpointType: string;
   onClose: () => void;
 }) {
-  const endpointType = _endpointType;
   const [name, setName] = useState(group?.name || '');
   const [strategy, setStrategy] = useState(group?.strategy || 'priority');
   const [isActive, setIsActive] = useState(group?.is_active ?? true);
@@ -320,6 +332,7 @@ function GroupModal({
   const [error, setError] = useState<string | null>(null);
 
   const isEdit = !!group;
+  const isDefault = group?.name === DEFAULT_GROUP_NAME;
   const maxRetries = group?.config?.max_retries ?? 3;
   const retryDelay = group?.config?.retry_delay_ms ?? 1000;
 
@@ -447,10 +460,19 @@ function GroupModal({
               value={name}
               onChange={(e) => { setName(e.target.value); setError(null); }}
               className="input-base font-mono"
+              disabled={isDefault}
+              title={isDefault ? '默认分组不可改名' : undefined}
             />
-            <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
-              请求时使用：<code className="bg-gray-100 dark:bg-gray-700 px-1 rounded">model=&quot;{name || 'xxx'}&quot;</code>
-            </p>
+            {isDefault && (
+              <p className="text-xs text-indigo-500 dark:text-indigo-400 mt-1">
+                默认分组不可改名或删除，仅可编辑模型列表和路由策略
+              </p>
+            )}
+            {!isDefault && (
+              <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                请求时使用：<code className="bg-gray-100 dark:bg-gray-700 px-1 rounded">model=&quot;{name || 'xxx'}&quot;</code>
+              </p>
+            )}
           </div>
 
           <div>

@@ -129,8 +129,12 @@ impl AppState {
 
         // 从数据库加载
         let providers = db.load_providers().context("加载供应商失败")?;
-        let groups = db.load_groups().context("加载组合失败")?;
+        let mut groups = db.load_groups().context("加载组合失败")?;
         let model_mappings = db.load_model_mappings().context("加载模型映射失败")?;
+
+        // 为 CLI 工具常用的端点类型 seed 默认空 Group
+        Self::seed_default_groups(&db, &mut groups)?;
+
         let settings = db.load_setting("settings")
             .ok()
             .flatten()
@@ -246,6 +250,28 @@ impl AppState {
                 g.name == name && g_endpoint == endpoint && g.is_active
             })
             .cloned()
+    }
+
+    /// Seed 默认空 Group（每个端点类型一个），确保 CLI 工具配置时始终有可选 Group
+    fn seed_default_groups(db: &Database, groups: &mut Vec<Group>) -> anyhow::Result<()> {
+        let default_endpoints = ["chat", "claude", "responses", "gemini"];
+
+        for ep in default_endpoints {
+            let exists = groups.iter().any(|g| {
+                let g_ep = g.endpoint_type.as_deref().unwrap_or("chat");
+                g.name == "default" && g_ep == ep
+            });
+            if !exists {
+                let mut group = Group::new("default".to_string());
+                group.endpoint_type = Some(ep.to_string());
+                group.description = Some(format!("默认 {} 端点分组（请添加模型后使用）", ep));
+                group.is_active = true;
+                db.save_group(&group)?;
+                groups.push(group);
+                tracing::info!("已创建默认 {} 端点分组", ep);
+            }
+        }
+        Ok(())
     }
 
     pub fn add_group(&self, group: Group) -> anyhow::Result<()> {

@@ -1,6 +1,7 @@
 import { useState, useEffect, useMemo } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { useProxy } from '../components/ProxyContext';
+import { sortDefaultFirst } from './Groups';
 
 interface CliToolStatus {
   toolId: string;
@@ -23,12 +24,6 @@ interface CliToolConfig {
   autoTakeover: boolean;
   sourceType: string;
   sourceValue: string;
-}
-
-interface CliGlobalSettings {
-  autoTakeoverOnStart: boolean;
-  autoRestoreOnStop: boolean;
-  apiKey: string;
 }
 
 interface TakeoverResult {
@@ -59,14 +54,13 @@ interface Group {
   is_active: boolean;
 }
 
+function defaultConfig(toolId: string): CliToolConfig {
+  return { toolId, enabled: true, autoTakeover: true, sourceType: 'group', sourceValue: 'free' };
+}
+
 function CliTools() {
   const { proxyStatus } = useProxy();
   const [tools, setTools] = useState<CliToolStatus[]>([]);
-  const [globalSettings, setGlobalSettings] = useState<CliGlobalSettings>({
-    autoTakeoverOnStart: true,
-    autoRestoreOnStop: true,
-    apiKey: 'uniroute',
-  });
   const [groups, setGroups] = useState<Group[]>([]);
   const [toolConfigs, setToolConfigs] = useState<Record<string, CliToolConfig>>({});
   const [loading, setLoading] = useState(false);
@@ -85,15 +79,13 @@ function CliTools() {
 
   const loadData = async () => {
     try {
-      const [statuses, settings, groupsResult, configs] = await Promise.all([
+      const [statuses, groupsResult, configs] = await Promise.all([
         invoke<CliToolStatus[]>('get_cli_tools_status'),
-        invoke<CliGlobalSettings>('get_cli_global_settings'),
         invoke<Group[]>('get_groups'),
         invoke<Record<string, CliToolConfig>>('get_all_cli_tool_configs'),
       ]);
       setTools(statuses);
-      setGlobalSettings(settings);
-      setGroups(groupsResult.filter(g => g.is_active));
+      setGroups(groupsResult.filter(g => g.is_active).sort(sortDefaultFirst));
       setToolConfigs(configs);
     } catch (e) {
       console.error('Failed to load CLI tools:', e);
@@ -117,13 +109,7 @@ function CliTools() {
     }
     setLoading(true);
     try {
-      const config = toolConfigs[toolId] || {
-        toolId,
-        enabled: true,
-        autoTakeover: true,
-        sourceType: 'group',
-        sourceValue: 'free',
-      };
+      const config = toolConfigs[toolId] || defaultConfig(toolId);
       const result = await invoke<TakeoverResult>('takeover_cli_tool', {
         toolId,
         proxyUrl,
@@ -152,15 +138,6 @@ function CliTools() {
     }
   };
 
-  const handleSaveGlobalSettings = async () => {
-    try {
-      await invoke('update_cli_global_settings', { settings: globalSettings });
-      showMessage('全局设置已保存');
-    } catch (e) {
-      showMessage('保存失败: ' + e);
-    }
-  };
-
   const handleOpenSourcePicker = (toolId: string) => {
     setSelectedTool(toolId);
     setShowSourcePicker(true);
@@ -171,7 +148,7 @@ function CliTools() {
     setShowSourcePicker(false);
 
     const newConfig: CliToolConfig = {
-      ...(toolConfigs[selectedTool] || { toolId: selectedTool, enabled: true, autoTakeover: true, sourceType: 'group', sourceValue: 'free' }),
+      ...(toolConfigs[selectedTool] || defaultConfig(selectedTool)),
       sourceType,
       sourceValue,
     };
@@ -195,7 +172,7 @@ function CliTools() {
 
   const handleToggleEnabled = async (toolId: string, enabled: boolean) => {
     const newConfig: CliToolConfig = {
-      ...(toolConfigs[toolId] || { toolId, enabled: true, autoTakeover: true, sourceType: 'group', sourceValue: 'free' }),
+      ...(toolConfigs[toolId] || defaultConfig(toolId)),
       enabled,
     };
     try {
@@ -256,6 +233,17 @@ function CliTools() {
     }
   };
 
+  const handleViewSnapshotContent = async (snapshotId: string) => {
+    try {
+      const files = await invoke<ConfigFileEntry[]>('get_cli_tool_snapshot_content', { snapshotId });
+      setConfigFiles(files);
+      setConfigViewerTitle(`快照 ${snapshotId}`);
+      setShowConfigViewer(true);
+    } catch (e) {
+      showMessage('加载快照内容失败: ' + e);
+    }
+  };
+
   const getToolIcon = (toolId: string) => {
     switch (toolId) {
       case 'claude': return '🤖';
@@ -288,53 +276,6 @@ function CliTools() {
             {actionMessage}
           </span>
         )}
-      </div>
-
-      {/* Global Settings */}
-      <div className="bg-white dark:bg-gray-800 shadow rounded-lg mb-6">
-        <div className="px-6 py-4 border-b border-gray-200 dark:border-gray-700">
-          <h2 className="text-lg font-medium text-gray-900 dark:text-white">全局设置</h2>
-        </div>
-        <div className="px-6 py-4 space-y-4">
-          <div className="flex items-center justify-between">
-            <div>
-              <label className="block text-sm font-medium text-gray-700 dark:text-gray-300">
-                代理启动时自动接管
-              </label>
-              <p className="text-xs text-gray-500 dark:text-gray-400">启动代理后自动将已启用的 CLI 工具指向代理</p>
-            </div>
-            <button
-              onClick={() => setGlobalSettings({ ...globalSettings, autoTakeoverOnStart: !globalSettings.autoTakeoverOnStart })}
-              className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${globalSettings.autoTakeoverOnStart ? 'bg-indigo-600' : 'bg-gray-300 dark:bg-gray-600'}`}
-            >
-              <span className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${globalSettings.autoTakeoverOnStart ? 'translate-x-6' : 'translate-x-1'}`} />
-            </button>
-          </div>
-
-          <div className="flex items-center justify-between">
-            <div>
-              <label className="block text-sm font-medium text-gray-700 dark:text-gray-300">
-                代理停止时自动恢复
-              </label>
-              <p className="text-xs text-gray-500 dark:text-gray-400">停止代理后自动恢复 CLI 工具的原始配置</p>
-            </div>
-            <button
-              onClick={() => setGlobalSettings({ ...globalSettings, autoRestoreOnStop: !globalSettings.autoRestoreOnStop })}
-              className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${globalSettings.autoRestoreOnStop ? 'bg-indigo-600' : 'bg-gray-300 dark:bg-gray-600'}`}
-            >
-              <span className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${globalSettings.autoRestoreOnStop ? 'translate-x-6' : 'translate-x-1'}`} />
-            </button>
-          </div>
-
-          <div className="flex items-center gap-3">
-            <button
-              onClick={handleSaveGlobalSettings}
-              className="px-4 py-1.5 text-sm font-medium text-white bg-indigo-600 rounded-md hover:bg-indigo-700"
-            >
-              保存设置
-            </button>
-          </div>
-        </div>
       </div>
 
       {/* Tool Cards */}
@@ -529,22 +470,33 @@ function CliTools() {
               ) : (
                 <div className="space-y-2">
                   {snapshots.map(s => (
-                    <div key={s.id} className="flex items-center justify-between p-3 bg-gray-50 dark:bg-gray-700/50 rounded-lg">
-                      <div>
-                        <div className="text-sm font-medium text-gray-900 dark:text-white font-mono">
-                          {s.createdAt}
+                    <div key={s.id} className="p-3 bg-gray-50 dark:bg-gray-700/50 rounded-lg">
+                      <div className="flex items-center justify-between">
+                        <div>
+                          <div className="text-sm font-medium text-gray-900 dark:text-white font-mono">
+                            {s.createdAt}
+                          </div>
+                          <div className="text-xs text-gray-500 dark:text-gray-400">
+                            {s.id} · {(s.sizeBytes / 1024).toFixed(1)} KB
+                          </div>
                         </div>
-                        <div className="text-xs text-gray-500 dark:text-gray-400">
-                          {s.id} · {(s.sizeBytes / 1024).toFixed(1)} KB
+                        <div className="flex items-center gap-2">
+                          <button
+                            onClick={() => handleViewSnapshotContent(s.id)}
+                            className="px-2 py-1.5 text-xs text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-300"
+                            title="查看配置内容"
+                          >
+                            👁
+                          </button>
+                          <button
+                            onClick={() => handleRestoreFromSnapshot(s.id)}
+                            disabled={loading}
+                            className="px-3 py-1.5 text-xs font-medium text-amber-700 dark:text-amber-300 bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 rounded-md hover:bg-amber-100 dark:hover:bg-amber-900/40 disabled:opacity-50"
+                          >
+                            恢复此版本
+                          </button>
                         </div>
                       </div>
-                      <button
-                        onClick={() => handleRestoreFromSnapshot(s.id)}
-                        disabled={loading}
-                        className="px-3 py-1.5 text-xs font-medium text-amber-700 dark:text-amber-300 bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 rounded-md hover:bg-amber-100 dark:hover:bg-amber-900/40 disabled:opacity-50"
-                      >
-                        恢复此版本
-                      </button>
                     </div>
                   ))}
                 </div>
